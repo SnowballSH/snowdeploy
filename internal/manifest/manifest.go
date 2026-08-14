@@ -6,6 +6,7 @@ package manifest
 import (
 	"bytes"
 	"fmt"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -16,7 +17,9 @@ const DefaultHealthTimeout = 30 * time.Second
 
 // Manifest is one managed service.
 type Manifest struct {
-	Name     string            `yaml:"name"`
+	Name        string `yaml:"name"`
+	Description string `yaml:"description"`
+
 	Image    Image             `yaml:"image"`
 	Template string            `yaml:"template"`
 	Port     int               `yaml:"port"`
@@ -25,6 +28,15 @@ type Manifest struct {
 	EnvFiles []string          `yaml:"env_files"`
 	Volumes  []string          `yaml:"volumes"`
 	Health   Health            `yaml:"health"`
+}
+
+// UnitDescription is what the rendered unit's Description= should say. It
+// falls back to the service name so the field stays optional.
+func (m *Manifest) UnitDescription() string {
+	if strings.TrimSpace(m.Description) != "" {
+		return m.Description
+	}
+	return m.Name
 }
 
 // Image pins the container image. Digest pins only; tags are rejected.

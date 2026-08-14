@@ -71,6 +71,7 @@ One file per service, named for the service:
 
 ```yaml
 name: web
+description: Acme web frontend      # optional; defaults to the name
 image:
   repository: registry.example.com/acme/web
   digest: sha256:0000000000000000000000000000000000000000000000000000000000000abc
@@ -82,7 +83,8 @@ env:
 env_files:
   - /etc/acme/web.env
 volumes:
-  - /srv/acme/web:/data:Z
+  - acme-data.volume:/data          # a named Quadlet volume, or…
+  - /srv/acme/web:/data:Z           # …a host path under `volume_prefixes`
 health:
   url: http://127.0.0.1:8080/healthz
   timeout: 45s
@@ -144,7 +146,8 @@ work in a script.
   text, before it is written, so a template cannot smuggle past the manifest
   rules. A rejected render never touches the unit directory.
 - **Confined host paths.** Volumes and env files must resolve under the
-  configured prefixes.
+  configured prefixes. A Quadlet named volume (`name.volume`) is exempt: it
+  resolves to a podman volume and cannot name a host path.
 - **Immutable receipts.** A finished journal entry can never be rewritten.
 
 ## Development

@@ -156,6 +156,38 @@ func TestValidateRejectsBadPort(t *testing.T) {
 	}
 }
 
+func TestValidateAcceptsNamedQuadletVolume(t *testing.T) {
+	m := valid(t)
+	m.Volumes = []string{"acme-data.volume:/data"}
+	if err := m.Validate(lim()); err != nil {
+		t.Fatalf("named Quadlet volume rejected: %v", err)
+	}
+}
+
+func TestParseKeepsDescription(t *testing.T) {
+	m, err := Parse([]byte(goodYAML + "description: Acme web frontend\n"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if m.Description != "Acme web frontend" {
+		t.Errorf("Description = %q", m.Description)
+	}
+	if err := m.Validate(lim()); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+}
+
+func TestDescriptionDefaultsToName(t *testing.T) {
+	m := valid(t)
+	if got := m.UnitDescription(); got != "web" {
+		t.Errorf("UnitDescription = %q, want the name", got)
+	}
+	m.Description = "Acme web frontend"
+	if got := m.UnitDescription(); got != "Acme web frontend" {
+		t.Errorf("UnitDescription = %q", got)
+	}
+}
+
 func TestValidateRejectsVolumeOutsidePrefix(t *testing.T) {
 	for _, v := range []string{
 		"/etc:/data:Z",

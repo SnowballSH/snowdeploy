@@ -12,6 +12,10 @@ import (
 // digestPattern is the only image pin a manifest may carry.
 var digestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 
+// namedVolume matches a Quadlet named-volume reference such as
+// `acme-data.volume`. It names a podman volume, never a host path.
+var namedVolume = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*\.volume$`)
+
 // Validate enforces the manifest half of the safety model: digest pins only,
 // a sane loopback port, and host paths confined to the configured prefixes.
 func (m *Manifest) Validate(lim Limits) error {
@@ -43,8 +47,13 @@ func (m *Manifest) Validate(lim Limits) error {
 	}
 
 	for _, v := range m.Volumes {
-		host, _, _ := strings.Cut(v, ":")
-		if err := validateHostPath(host, lim.VolumePrefixes); err != nil {
+		source, _, _ := strings.Cut(v, ":")
+		if namedVolume.MatchString(source) {
+			// A Quadlet named volume resolves to a podman volume and cannot
+			// name a host path, so there is nothing to confine.
+			continue
+		}
+		if err := validateHostPath(source, lim.VolumePrefixes); err != nil {
 			fail("volume %q: %w", v, err)
 		}
 	}
