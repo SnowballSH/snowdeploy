@@ -1,0 +1,49 @@
+# snowdeployd configuration.
+#
+# Every site-specific name lives here; the binary carries none of them. The two
+# listeners must stay on loopback — the daemon expects an authenticating proxy
+# in front of it, and refuses to start on any other address.
+
+listen: 127.0.0.1:8092
+metrics_listen: 127.0.0.1:9105
+
+# The Git repository holding the service manifests. Only its merged branch is
+# ever applied.
+repo_url: https://github.com/example/config
+repo_branch: main
+manifest_dir: deploy/manifests
+template_dir: deploy/templates
+cache_dir: /var/lib/snowdeploy/repo
+
+# Where rendered Quadlet units are written, for this user's systemd instance.
+unit_dir: /home/apps/.config/containers/systemd
+
+# Append-only deploy record. Back this up.
+journal_path: /var/lib/snowdeploy/journal.db
+
+# The GitHub App allowed to author manifest pull requests. The key file is
+# read fresh on every operation and never cached, so a secret store that is
+# sealed makes deploys fail closed instead of the daemon failing to start.
+# Replace both ids with the values from your own App installation.
+github_app_id: 111111
+github_install_id: 22222222
+github_key_file: /run/snowdeploy/app.pem
+github_owner: example
+github_repo: config
+
+# SHA-256 hashes of accepted CLI bearer tokens, one per line, each optionally
+# followed by a label used as the journalled actor. Absent means no CLI access.
+cli_token_hash_file: /run/snowdeploy/cli-tokens.sha256
+
+# How often to ask the registry for new digests, to compare running containers
+# against merged manifests, and to poll a pull request's checks.
+poll_interval: 5m
+drift_interval: 5m
+check_poll_interval: 15s
+probe_interval: 2s
+
+# Host paths a manifest may mount or read. Empty disables the check; set them.
+volume_prefixes:
+  - /srv/example/
+env_file_prefixes:
+  - /etc/example/
