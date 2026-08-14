@@ -235,6 +235,25 @@ func (j *Journal) LastHealthyDigest(service string) (string, error) {
 	return digest, nil
 }
 
+// PreviousHealthyDigest is the newest digest that reached healthy and is not
+// notDigest. This — not the newest healthy digest — is what a rollback with no
+// explicit target means: the newest healthy digest is usually the one running.
+func (j *Journal) PreviousHealthyDigest(service, notDigest string) (string, error) {
+	var digest string
+	err := j.db.QueryRow(`
+		SELECT new_digest FROM deploys
+		WHERE service = ? AND state = ? AND new_digest != '' AND new_digest != ?
+		ORDER BY started_at DESC, id DESC LIMIT 1`,
+		service, StateHealthy, notDigest).Scan(&digest)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return "", fmt.Errorf("%s (other than %s): %w", service, notDigest, ErrNoHealthyDeploy)
+	case err != nil:
+		return "", fmt.Errorf("read previous healthy digest for %s: %w", service, err)
+	}
+	return digest, nil
+}
+
 type scanner interface {
 	Scan(dest ...any) error
 }

@@ -142,7 +142,7 @@ func TestApplyRefusesEscapingTemplateBeforeWriting(t *testing.T) {
 	f := newFakeSystemd()
 	a := &Applier{S: f}
 
-	err := a.Apply(t.Context(), testManifest(), escapingTemplate)
+	err := a.Apply(t.Context(), testManifest(), escapingTemplate, nil)
 	if err == nil {
 		t.Fatal("Apply accepted a template that renders Privileged=true")
 	}
@@ -160,7 +160,7 @@ func TestApplyRefusesNonLoopbackPublishBeforeWriting(t *testing.T) {
 
 	tmpl := "[Container]\nImage={{.Image.Repository}}@{{.Image.Digest}}\n" +
 		"PublishPort=0.0.0.0:{{.Port}}:{{.Port}}\n"
-	if err := a.Apply(t.Context(), testManifest(), tmpl); err == nil {
+	if err := a.Apply(t.Context(), testManifest(), tmpl, nil); err == nil {
 		t.Fatal("Apply accepted a public publish")
 	}
 	if calls := f.recorded(); len(calls) != 0 {
@@ -180,7 +180,7 @@ func TestApplyHappyPathCallOrder(t *testing.T) {
 	f := newFakeSystemd()
 	a := &Applier{S: f}
 
-	if err := a.Apply(t.Context(), m, safeTemplate); err != nil {
+	if err := a.Apply(t.Context(), m, safeTemplate, nil); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 
@@ -207,7 +207,7 @@ func TestApplyStopsWhenRestartFails(t *testing.T) {
 	m := testManifest()
 	m.Health.URL = "http://127.0.0.1:1/healthz"
 
-	err := a.Apply(t.Context(), m, safeTemplate)
+	err := a.Apply(t.Context(), m, safeTemplate, nil)
 	if err == nil {
 		t.Fatal("Apply succeeded despite a failed restart")
 	}

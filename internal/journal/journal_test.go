@@ -160,6 +160,45 @@ func TestLastHealthyDigest(t *testing.T) {
 	}
 }
 
+func TestPreviousHealthyDigestSkipsTheCurrentOne(t *testing.T) {
+	j := open(t)
+
+	for i, d := range []string{"sha256:one", "sha256:two", "sha256:three"} {
+		e := sample()
+		e.NewDigest = d
+		e.StartedAt = e.StartedAt.Add(time.Duration(i) * time.Minute)
+		id, _ := j.Begin(e)
+		if err := j.Finish(id, StateHealthy, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := j.PreviousHealthyDigest("web", "sha256:three")
+	if err != nil {
+		t.Fatalf("PreviousHealthyDigest: %v", err)
+	}
+	if got != "sha256:two" {
+		t.Errorf("PreviousHealthyDigest = %q, want sha256:two", got)
+	}
+
+	if _, err := j.PreviousHealthyDigest("web", "sha256:nothing-matches-here"); err != nil {
+		t.Errorf("excluding an unrelated digest should still find one: %v", err)
+	}
+}
+
+func TestPreviousHealthyDigestWithOnlyTheCurrentOne(t *testing.T) {
+	j := open(t)
+	e := sample()
+	e.NewDigest = "sha256:only"
+	id, _ := j.Begin(e)
+	if err := j.Finish(id, StateHealthy, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.PreviousHealthyDigest("web", "sha256:only"); !errors.Is(err, ErrNoHealthyDeploy) {
+		t.Fatalf("err = %v, want ErrNoHealthyDeploy", err)
+	}
+}
+
 func TestFinishedRowIsImmutable(t *testing.T) {
 	j := open(t)
 	id, _ := j.Begin(sample())
