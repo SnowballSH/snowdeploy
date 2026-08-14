@@ -3,5 +3,5 @@
 *.db
 *.db-shm
 *.db-wal
-node_modules/
+# web/node_modules is ignored by web/.gitignore; web/dist is committed on purpose.
 .DS_Store

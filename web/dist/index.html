@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>snowdeploy</title>
+    <script>
+      // Set the theme before paint so the first frame is never the wrong one.
+      (() => {
+        const stored = localStorage.getItem("theme");
+        const dark =
+          stored === "dark" ||
+          (stored === null &&
+            window.matchMedia("(prefers-color-scheme: dark)").matches);
+        document.documentElement.dataset.theme = dark ? "dark" : "light";
+      })();
+    </script>
+    <script type="module" crossorigin src="/assets/index-BXI4nBo-.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-Ch4avC8U.css">
+  </head>
+  <body>
+    <div id="app"></div>
+  </body>
+</html>

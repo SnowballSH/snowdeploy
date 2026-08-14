@@ -30,3 +30,30 @@ jobs:
         with:
           go-version-file: go.mod
       - run: go build ./...
+
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      # The built assets are committed so `go build` needs no Node toolchain.
+      # If a source change was not rebuilt, this fails rather than shipping a
+      # binary whose embedded UI does not match its source.
+      - name: dist is current
+        run: git diff --exit-code -- dist
+      # The fonts are self-hosted; a missing @font-face fails silently at
+      # runtime, so assert the bytes are actually in the bundle.
+      - name: fonts are bundled
+        run: |
+          test "$(grep -rl '@font-face' dist | wc -l)" -ge 1
+          test "$(find dist -name '*.woff2' | wc -l)" -ge 6

@@ -1,0 +1,11 @@
+@import "@fontsource-variable/inter";
+@import "@fontsource-variable/jetbrains-mono";
+
+@import "tailwindcss";
+@import "foundationui/tokens.css";
+@import "foundationui/theme.css";
+@source "../node_modules/foundationui";
+
+body {
+  font-family: var(--fui-font-sans);
+}

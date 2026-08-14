@@ -147,6 +147,7 @@ func build(ctx context.Context, cfg *config.Config) (*daemon, error) {
 		Watcher:          watcher,
 		History:          jrnl,
 		CLITokenHashFile: cfg.CLITokenHashFile,
+		UI:               api.UI(),
 	})
 
 	// The first sync is best-effort: a daemon that cannot reach GitHub must
