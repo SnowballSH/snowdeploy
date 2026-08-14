@@ -1,0 +1,58 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Build static linux/amd64 binaries
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for cmd in snowdeployd snowdeploy; do
+            CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+              go build -trimpath -ldflags "-s -w -X main.version=${TAG}" \
+              -o "dist/${cmd}" "./cmd/${cmd}"
+          done
+
+      - name: Record checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum snowdeployd snowdeploy > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Verify the binaries are static and stamped
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          file dist/snowdeployd | grep -q "statically linked"
+          file dist/snowdeploy  | grep -q "statically linked"
+          # The stamp is what a host's receipt pins; an unstamped binary would
+          # make every deployed version indistinguishable.
+          strings dist/snowdeployd | grep -qF "${TAG}"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "${TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${TAG}" \
+            --generate-notes \
+            dist/snowdeployd dist/snowdeploy dist/SHA256SUMS
