@@ -10,9 +10,12 @@ linters:
     - revive
   exclusions:
     rules:
+      # Test helpers close response bodies via t.Cleanup, which bodyclose
+      # cannot follow, and hard-coded fixtures are not secrets.
       - path: _test\.go$
         linters:
           - gosec
+          - bodyclose
 
 formatters:
   enable:

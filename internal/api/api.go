@@ -1,0 +1,314 @@
+// Package api is the daemon's HTTP surface: a small JSON API, a live event
+// stream, and a separate Prometheus listener. Authentication is either a
+// bearer token whose hash the operator placed on disk, or the identity a
+// fronting proxy has already established.
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"strconv"
+	"strings"
+
+	"github.com/SnowballSH/snowdeploy/internal/deploy"
+	"github.com/SnowballSH/snowdeploy/internal/journal"
+	"github.com/SnowballSH/snowdeploy/internal/manifest"
+)
+
+// defaultHistory bounds an unqualified history request.
+const defaultHistory = 20
+
+// maxHistory bounds a caller-supplied one.
+const maxHistory = 200
+
+// Engine is the deploy machinery the API drives.
+type Engine interface {
+	Deploy(ctx context.Context, service, digest, actor string) (int64, error)
+	Rollback(ctx context.Context, service, toDigest, actor string) (int64, error)
+	Drift(ctx context.Context) (map[string]string, error)
+	QueueDepth() int64
+}
+
+// Repo is the merged-manifest view.
+type Repo interface {
+	Sync(ctx context.Context) (string, error)
+	Services() ([]string, error)
+	Manifest(service string) (*manifest.Manifest, []byte, error)
+}
+
+// Inspector reports the digest actually running.
+type Inspector interface {
+	RunningImage(ctx context.Context, service string) (string, error)
+}
+
+// Watcher reports the newest digest a registry offers.
+type Watcher interface {
+	Latest(repository string) (string, bool)
+}
+
+// History reads deploy receipts.
+type History interface {
+	Recent(service string, n int) ([]journal.Entry, error)
+}
+
+// ServiceStatus is one row of the service list.
+type ServiceStatus struct {
+	Name            string         `json:"name"`
+	Repository      string         `json:"repository"`
+	ManifestDigest  string         `json:"manifestDigest"`
+	RunningDigest   string         `json:"runningDigest"`
+	LatestAvailable string         `json:"latestAvailable"`
+	Drifted         bool           `json:"drifted"`
+	LastDeploy      *journal.Entry `json:"lastDeploy,omitempty"`
+}
+
+// Options are the server's dependencies.
+type Options struct {
+	Engine           Engine
+	Repo             Repo
+	Inspector        Inspector
+	Watcher          Watcher
+	History          History
+	CLITokenHashFile string
+	UI               http.Handler
+}
+
+// Server is the API. Publish feeds it the engine's events.
+type Server struct {
+	opts    Options
+	auth    *authenticator
+	broker  *broker
+	metrics *metrics
+}
+
+// New builds the server.
+func New(opts Options) *Server {
+	s := &Server{
+		opts:   opts,
+		auth:   &authenticator{tokenHashFile: opts.CLITokenHashFile},
+		broker: newBroker(),
+	}
+	s.metrics = newMetrics(func() float64 {
+		if opts.Engine == nil {
+			return 0
+		}
+		return float64(opts.Engine.QueueDepth())
+	})
+	return s
+}
+
+// Publish records an event and fans it out. It is the engine's Notify.
+func (s *Server) Publish(ev deploy.Event) {
+	s.metrics.observe(ev)
+	s.broker.publish(ev)
+}
+
+// SetDrift republishes the drift gauges.
+func (s *Server) SetDrift(drift map[string]string) {
+	known, err := s.opts.Repo.Services()
+	if err != nil {
+		known = nil
+	}
+	s.metrics.setDrift(drift, known)
+}
+
+// Handler is the loopback API and, when configured, the embedded UI.
+func (s *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, _ = w.Write([]byte("ok\n"))
+	})
+
+	mux.Handle("GET /api/v1/services", s.authed(s.handleServices))
+	mux.Handle("GET /api/v1/services/{name}/history", s.authed(s.handleHistory))
+	mux.Handle("POST /api/v1/services/{name}/deploy", s.authed(s.handleDeploy))
+	mux.Handle("POST /api/v1/services/{name}/rollback", s.authed(s.handleRollback))
+	mux.Handle("GET /api/v1/events", s.authed(func(w http.ResponseWriter, r *http.Request, _ string) {
+		s.handleEvents(w, r)
+	}))
+
+	if s.opts.UI != nil {
+		mux.Handle("/", s.opts.UI)
+	}
+	return mux
+}
+
+// MetricsHandler is the separate scrape listener. It carries no deploy API:
+// a scrape target must never be a control plane.
+func (s *Server) MetricsHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.Handle("GET /metrics", s.metrics.handler())
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("ok\n"))
+	})
+	return mux
+}
+
+// actorHandler is a handler that has already been given an authenticated actor.
+type actorHandler func(w http.ResponseWriter, r *http.Request, actor string)
+
+func (s *Server) authed(h actorHandler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		actor, ok := s.auth.actor(r)
+		if !ok {
+			writeError(w, http.StatusUnauthorized, errors.New("no authenticated identity"))
+			return
+		}
+		h(w, r, actor)
+	})
+}
+
+func (s *Server) handleServices(w http.ResponseWriter, r *http.Request, _ string) {
+	if _, err := s.opts.Repo.Sync(r.Context()); err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	names, err := s.opts.Repo.Services()
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+
+	out := make([]ServiceStatus, 0, len(names))
+	for _, name := range names {
+		out = append(out, s.status(r.Context(), name))
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) status(ctx context.Context, name string) ServiceStatus {
+	st := ServiceStatus{Name: name}
+
+	m, _, err := s.opts.Repo.Manifest(name)
+	if err != nil {
+		return st
+	}
+	st.Repository = m.Image.Repository
+	st.ManifestDigest = m.Image.Digest
+
+	if running, err := s.opts.Inspector.RunningImage(ctx, name); err == nil {
+		st.RunningDigest = running
+	}
+	st.Drifted = st.RunningDigest != st.ManifestDigest
+
+	if latest, ok := s.opts.Watcher.Latest(m.Image.Repository); ok {
+		st.LatestAvailable = latest
+	}
+	if recent, err := s.opts.History.Recent(name, 1); err == nil && len(recent) > 0 {
+		entry := recent[0]
+		st.LastDeploy = &entry
+	}
+	return st
+}
+
+func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request, _ string) {
+	name, ok := s.service(w, r)
+	if !ok {
+		return
+	}
+
+	n := defaultHistory
+	if raw := r.URL.Query().Get("n"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 {
+			writeError(w, http.StatusBadRequest, errors.New("n must be a positive integer"))
+			return
+		}
+		n = min(parsed, maxHistory)
+	}
+
+	entries, err := s.opts.History.Recent(name, n)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if entries == nil {
+		entries = []journal.Entry{}
+	}
+	writeJSON(w, http.StatusOK, entries)
+}
+
+type digestRequest struct {
+	Digest string `json:"digest"`
+}
+
+func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request, actor string) {
+	name, ok := s.service(w, r)
+	if !ok {
+		return
+	}
+	req, ok := decodeDigest(w, r)
+	if !ok {
+		return
+	}
+	if req.Digest == "" {
+		writeError(w, http.StatusBadRequest, errors.New("digest is required"))
+		return
+	}
+	s.dispatch(w, r, func() (int64, error) {
+		return s.opts.Engine.Deploy(r.Context(), name, req.Digest, actor)
+	})
+}
+
+func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request, actor string) {
+	name, ok := s.service(w, r)
+	if !ok {
+		return
+	}
+	req, ok := decodeDigest(w, r)
+	if !ok {
+		return
+	}
+	s.dispatch(w, r, func() (int64, error) {
+		return s.opts.Engine.Rollback(r.Context(), name, req.Digest, actor)
+	})
+}
+
+func (s *Server) dispatch(w http.ResponseWriter, _ *http.Request, run func() (int64, error)) {
+	id, err := run()
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]int64{"journalId": id})
+}
+
+// service resolves and validates the path's service name against the merged
+// manifests, so an unknown or crafted name never reaches the engine.
+func (s *Server) service(w http.ResponseWriter, r *http.Request) (string, bool) {
+	name := r.PathValue("name")
+	if name == "" || strings.ContainsAny(name, "/\\") || strings.Contains(name, "..") {
+		writeError(w, http.StatusBadRequest, errors.New("invalid service name"))
+		return "", false
+	}
+	if _, _, err := s.opts.Repo.Manifest(name); err != nil {
+		writeError(w, http.StatusNotFound, errors.New("no such service"))
+		return "", false
+	}
+	return name, true
+}
+
+func decodeDigest(w http.ResponseWriter, r *http.Request) (digestRequest, bool) {
+	var req digestRequest
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil && err.Error() != "EOF" {
+		writeError(w, http.StatusBadRequest, err)
+		return digestRequest{}, false
+	}
+	return req, true
+}
+
+func writeJSON(w http.ResponseWriter, code int, body any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(body)
+}
+
+func writeError(w http.ResponseWriter, code int, err error) {
+	writeJSON(w, code, map[string]string{"error": err.Error()})
+}
