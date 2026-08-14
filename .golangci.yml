@@ -16,6 +16,12 @@ linters:
         linters:
           - gosec
           - bodyclose
+      # A command-line tool that cannot write to its own stdout has nowhere to
+      # report the failure; the exit code already carries the outcome.
+      - path: ^cmd/
+        linters:
+          - errcheck
+        source: fmt\.Fprint
 
 formatters:
   enable:
