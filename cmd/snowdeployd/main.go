@@ -1,3 +1,4 @@
+// Command snowdeployd is the host deploy daemon.
 package main
 
 import (
@@ -8,6 +9,7 @@ import (
 var version = "dev"
 
 func main() {
-	fmt.Fprintf(os.Stdout, "snowdeployd %s\n", version)
-	os.Exit(0)
+	if _, err := fmt.Fprintf(os.Stdout, "snowdeployd %s\n", version); err != nil {
+		os.Exit(1)
+	}
 }

@@ -1,3 +1,4 @@
+// Command snowdeploy is the client for a snowdeployd daemon.
 package main
 
 import (
@@ -8,6 +9,7 @@ import (
 var version = "dev"
 
 func main() {
-	fmt.Fprintf(os.Stdout, "snowdeploy %s\n", version)
-	os.Exit(0)
+	if _, err := fmt.Fprintf(os.Stdout, "snowdeploy %s\n", version); err != nil {
+		os.Exit(1)
+	}
 }
