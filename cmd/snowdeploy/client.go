@@ -14,8 +14,8 @@ import (
 	"time"
 )
 
-// client talks to a snowdeployd over the tailnet. It holds no credential of
-// its own: the token, if any, is read from a file the operator controls.
+// client talks to a snowdeployd. It holds no credential of its own: the token,
+// if any, is read from a file the operator controls.
 type client struct {
 	baseURL   string
 	tokenFile string
