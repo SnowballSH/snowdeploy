@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/SnowballSH/snowdeploy/internal/gitops"
 	"github.com/SnowballSH/snowdeploy/internal/journal"
 	"github.com/SnowballSH/snowdeploy/internal/manifest"
 	"github.com/SnowballSH/snowdeploy/internal/reconcile"
@@ -62,6 +63,17 @@ func (r *fakeRepo) Sync(context.Context) (string, error) {
 		return "", r.syncErr
 	}
 	return "headsha", nil
+}
+
+// SyncState mirrors the gitops contract: the reason is safe fixed vocabulary,
+// never the error Sync returned.
+func (r *fakeRepo) SyncState() (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.syncErr != nil {
+		return true, errors.New("the configuration repository could not be fetched")
+	}
+	return true, nil
 }
 
 func (r *fakeRepo) Manifest(service string) (*manifest.Manifest, []byte, error) {
@@ -385,14 +397,14 @@ func (h *harness) entry(t *testing.T, id int64) journal.Entry {
 func TestDeployHappyPathStateSequence(t *testing.T) {
 	h := newHarness(t, digestA)
 
-	id, err := h.engine.Deploy(t.Context(), "web", digestB, "admin")
+	id, _, err := h.engine.Deploy(t.Context(), "web", digestB, "admin")
 	if err != nil {
 		t.Fatalf("Deploy: %v", err)
 	}
 	h.waitTerminal(t)
 
 	want := []string{
-		StateDetected, StatePROpen, StateChecks, StateMerged,
+		StateDetected, StateDetected, StatePROpen, StateChecks, StateMerged,
 		StateReconciling, StateProbing, StateHealthy,
 	}
 	got := h.states()
@@ -450,7 +462,7 @@ func TestDeployHappyPathStateSequence(t *testing.T) {
 func TestEventsCarryThePullRequestTrail(t *testing.T) {
 	h := newHarness(t, digestA)
 
-	if _, err := h.engine.Deploy(t.Context(), "web", digestB, "admin"); err != nil {
+	if _, _, err := h.engine.Deploy(t.Context(), "web", digestB, "admin"); err != nil {
 		t.Fatalf("Deploy: %v", err)
 	}
 	h.waitTerminal(t)
@@ -486,7 +498,7 @@ func TestFailedChecksNeverTouchTheHost(t *testing.T) {
 	h.pr.checksOK = false
 	h.pr.checksDetail = `check "verify" concluded failure`
 
-	id, err := h.engine.Deploy(t.Context(), "web", digestB, "admin")
+	id, _, err := h.engine.Deploy(t.Context(), "web", digestB, "admin")
 	if err != nil {
 		t.Fatalf("Deploy: %v", err)
 	}
@@ -520,7 +532,7 @@ func TestProbeFailureRollsBackAndRevertsMain(t *testing.T) {
 	h := newHarness(t, digestA)
 	h.applier.failOn[digestB] = errors.New("web did not become healthy")
 
-	id, err := h.engine.Deploy(t.Context(), "web", digestB, "admin")
+	id, _, err := h.engine.Deploy(t.Context(), "web", digestB, "admin")
 	if err != nil {
 		t.Fatalf("Deploy: %v", err)
 	}
@@ -617,7 +629,7 @@ func TestQueuedDeployProposesAgainstTheManifestAtTheFrontOfTheQueue(t *testing.T
 	}
 	h.pr.mu.Unlock()
 
-	first, err := h.engine.Deploy(t.Context(), "web", digestB, "admin")
+	first, _, err := h.engine.Deploy(t.Context(), "web", digestB, "admin")
 	if err != nil {
 		t.Fatalf("Deploy to %s: %v", digestB, err)
 	}
@@ -625,7 +637,7 @@ func TestQueuedDeployProposesAgainstTheManifestAtTheFrontOfTheQueue(t *testing.T
 
 	// Clicked while main still pins digestA: the click-time proposal would
 	// say A -> C, and the click-time rollback target would be A.
-	second, err := h.engine.Deploy(t.Context(), "web", digestC, "admin")
+	second, _, err := h.engine.Deploy(t.Context(), "web", digestC, "admin")
 	if err != nil {
 		t.Fatalf("Deploy to %s: %v", digestC, err)
 	}
@@ -680,11 +692,11 @@ func TestQueuedDeployFailsWhenTheManifestChangedShape(t *testing.T) {
 	}
 	h.pr.mu.Unlock()
 
-	if _, err := h.engine.Deploy(t.Context(), "web", digestB, "admin"); err != nil {
+	if _, _, err := h.engine.Deploy(t.Context(), "web", digestB, "admin"); err != nil {
 		t.Fatalf("Deploy: %v", err)
 	}
 	<-firstOpen
-	second, err := h.engine.Deploy(t.Context(), "web", digestC, "admin")
+	second, _, err := h.engine.Deploy(t.Context(), "web", digestC, "admin")
 	if err != nil {
 		t.Fatalf("second Deploy: %v", err)
 	}
@@ -709,7 +721,7 @@ func TestRollbackAlsoFailingLeavesFailedState(t *testing.T) {
 	h.applier.failOn[digestB] = errors.New("probe red")
 	h.applier.failOn[digestA] = errors.New("old image gone too")
 
-	id, err := h.engine.Deploy(t.Context(), "web", digestB, "admin")
+	id, _, err := h.engine.Deploy(t.Context(), "web", digestB, "admin")
 	if err != nil {
 		t.Fatalf("Deploy: %v", err)
 	}
@@ -729,7 +741,7 @@ func TestSecondDeployQueuesBehindTheFirst(t *testing.T) {
 	gate := make(chan struct{})
 	h.applier.gate = gate
 
-	if _, err := h.engine.Deploy(t.Context(), "web", digestB, "admin"); err != nil {
+	if _, _, err := h.engine.Deploy(t.Context(), "web", digestB, "admin"); err != nil {
 		t.Fatalf("first Deploy: %v", err)
 	}
 
@@ -742,7 +754,7 @@ func TestSecondDeployQueuesBehindTheFirst(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 
-	if _, err := h.engine.Deploy(t.Context(), "web", digestC, "admin"); err != nil {
+	if _, _, err := h.engine.Deploy(t.Context(), "web", digestC, "admin"); err != nil {
 		t.Fatalf("second Deploy: %v", err)
 	}
 
@@ -776,7 +788,7 @@ func TestSecondDeployQueuesBehindTheFirst(t *testing.T) {
 func TestRollbackWithNoTargetUsesLastHealthyDigest(t *testing.T) {
 	h := newHarness(t, digestA)
 
-	if _, err := h.engine.Deploy(t.Context(), "web", digestB, "admin"); err != nil {
+	if _, _, err := h.engine.Deploy(t.Context(), "web", digestB, "admin"); err != nil {
 		t.Fatalf("Deploy: %v", err)
 	}
 	h.waitTerminal(t)
@@ -785,14 +797,14 @@ func TestRollbackWithNoTargetUsesLastHealthyDigest(t *testing.T) {
 
 	// main now pins digestB. A second deploy makes digestC current and leaves
 	// digestB as the newest healthy digest that is *not* running.
-	if _, err := h.engine.Deploy(t.Context(), "web", digestC, "operator"); err != nil {
+	if _, _, err := h.engine.Deploy(t.Context(), "web", digestC, "operator"); err != nil {
 		t.Fatalf("second Deploy: %v", err)
 	}
 	h.waitTerminal(t)
 
 	h.reset()
 
-	id, err := h.engine.Rollback(t.Context(), "web", "", "operator")
+	id, _, err := h.engine.Rollback(t.Context(), "web", "", "operator")
 	if err != nil {
 		t.Fatalf("Rollback: %v", err)
 	}
@@ -812,7 +824,7 @@ func TestRollbackWithNoTargetUsesLastHealthyDigest(t *testing.T) {
 
 func TestRollbackWithNoHistoryFailsClosed(t *testing.T) {
 	h := newHarness(t, digestA)
-	if _, err := h.engine.Rollback(t.Context(), "web", "", "operator"); err == nil {
+	if _, _, err := h.engine.Rollback(t.Context(), "web", "", "operator"); err == nil {
 		t.Fatal("rollback succeeded with no healthy history")
 	}
 	if applied := h.applier.calls(); len(applied) != 0 {
@@ -822,7 +834,7 @@ func TestRollbackWithNoHistoryFailsClosed(t *testing.T) {
 
 func TestDeployRejectsTheDigestAlreadyPinned(t *testing.T) {
 	h := newHarness(t, digestA)
-	_, err := h.engine.Deploy(t.Context(), "web", digestA, "admin")
+	_, _, err := h.engine.Deploy(t.Context(), "web", digestA, "admin")
 	if !errors.Is(err, ErrAlreadyAtDigest) {
 		t.Fatalf("err = %v, want ErrAlreadyAtDigest", err)
 	}
@@ -831,7 +843,7 @@ func TestDeployRejectsTheDigestAlreadyPinned(t *testing.T) {
 func TestDeployRejectsInvalidDigest(t *testing.T) {
 	h := newHarness(t, digestA)
 	for _, d := range []string{"", "latest", "sha256:short", "registry/x:tag"} {
-		if _, err := h.engine.Deploy(t.Context(), "web", d, "admin"); err == nil {
+		if _, _, err := h.engine.Deploy(t.Context(), "web", d, "admin"); err == nil {
 			t.Errorf("digest %q accepted", d)
 		}
 	}
@@ -839,7 +851,7 @@ func TestDeployRejectsInvalidDigest(t *testing.T) {
 
 func TestDeployRejectsUnknownService(t *testing.T) {
 	h := newHarness(t, digestA)
-	if _, err := h.engine.Deploy(t.Context(), "nope", digestB, "admin"); err == nil {
+	if _, _, err := h.engine.Deploy(t.Context(), "nope", digestB, "admin"); err == nil {
 		t.Fatal("unknown service accepted")
 	}
 }
@@ -912,7 +924,7 @@ func TestRefusedMergeRecoversAfterBranchUpdate(t *testing.T) {
 	h.pr.mergeErrTimes = 1
 	h.pr.mu.Unlock()
 
-	id, err := h.engine.Deploy(t.Context(), "web", digestB, "admin")
+	id, _, err := h.engine.Deploy(t.Context(), "web", digestB, "admin")
 	if err != nil {
 		t.Fatalf("Deploy: %v", err)
 	}
@@ -942,7 +954,7 @@ func TestExhaustedMergeRetriesFailAndCloseThePR(t *testing.T) {
 	h.pr.mergeErr = errors.New("405 base branch was modified")
 	h.pr.mu.Unlock()
 
-	id, err := h.engine.Deploy(t.Context(), "web", digestB, "admin")
+	id, _, err := h.engine.Deploy(t.Context(), "web", digestB, "admin")
 	if err != nil {
 		t.Fatalf("Deploy: %v", err)
 	}
@@ -984,10 +996,10 @@ func TestConcurrentDeploysSerializeTheMergeSpan(t *testing.T) {
 	h.pr.mu.Unlock()
 	h.pr.onMerge = func() { depth.Add(-1) }
 
-	if _, err := h.engine.Deploy(t.Context(), "web", digestB, "admin"); err != nil {
+	if _, _, err := h.engine.Deploy(t.Context(), "web", digestB, "admin"); err != nil {
 		t.Fatalf("Deploy web: %v", err)
 	}
-	if _, err := h.engine.Deploy(t.Context(), "api", digestB, "admin"); err != nil {
+	if _, _, err := h.engine.Deploy(t.Context(), "api", digestB, "admin"); err != nil {
 		t.Fatalf("Deploy api: %v", err)
 	}
 	h.engine.Wait()
@@ -1007,11 +1019,11 @@ func TestDuplicateClickJoinsThePendingDeploy(t *testing.T) {
 	h := newHarness(t, digestA)
 	h.applier.gate = make(chan struct{})
 
-	first, err := h.engine.Deploy(t.Context(), "web", digestB, "admin")
+	first, firstJoined, err := h.engine.Deploy(t.Context(), "web", digestB, "admin")
 	if err != nil {
 		t.Fatalf("Deploy: %v", err)
 	}
-	second, err := h.engine.Deploy(t.Context(), "web", digestB, "admin")
+	second, secondJoined, err := h.engine.Deploy(t.Context(), "web", digestB, "admin")
 	if err != nil {
 		t.Fatalf("second Deploy: %v", err)
 	}
@@ -1021,9 +1033,141 @@ func TestDuplicateClickJoinsThePendingDeploy(t *testing.T) {
 	if first != second {
 		t.Fatalf("duplicate click journaled a second run: %d vs %d", first, second)
 	}
+	if firstJoined {
+		t.Error("the click that started the run reported itself as joining one")
+	}
+	if !secondJoined {
+		t.Error("the duplicate click was not told it joined an existing deploy")
+	}
 	opened, _, _ := h.pr.snapshot()
 	if len(opened) != 1 {
 		t.Fatalf("duplicate click opened a second proposal: %d", len(opened))
+	}
+}
+
+// The dedup check, the journal write, and the registration are one critical
+// section: with the lock dropped around Begin, two identical clicks racing
+// each other both pass the check and both journal a run.
+func TestConcurrentIdenticalClicksJournalExactlyOneRun(t *testing.T) {
+	h := newHarness(t, digestA)
+	h.applier.gate = make(chan struct{})
+
+	const clicks = 8
+	var (
+		start = make(chan struct{})
+		wg    sync.WaitGroup
+		mu    sync.Mutex
+		ids   []int64
+		fresh int
+	)
+	for range clicks {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			id, joined, err := h.engine.Deploy(t.Context(), "web", digestB, "admin")
+			if err != nil {
+				t.Errorf("Deploy: %v", err)
+				return
+			}
+			mu.Lock()
+			ids = append(ids, id)
+			if !joined {
+				fresh++
+			}
+			mu.Unlock()
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(h.applier.gate)
+	h.engine.Wait()
+
+	for _, id := range ids {
+		if id != ids[0] {
+			t.Fatalf("racing clicks were answered with different runs: %v", ids)
+		}
+	}
+	if fresh != 1 {
+		t.Errorf("%d clicks believe they started the run, want exactly 1", fresh)
+	}
+	entries, err := h.jrnl.Recent("web", 50)
+	if err != nil {
+		t.Fatalf("Recent: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("racing clicks journaled %d runs, want 1", len(entries))
+	}
+	opened, _, _ := h.pr.snapshot()
+	if len(opened) != 1 {
+		t.Fatalf("racing clicks opened %d proposals, want 1", len(opened))
+	}
+}
+
+// A click for a different digest while a run is live must neither be refused
+// nor steal the live run's dedup entry: it queues as its own run, and later
+// clicks for the live digest still join the original.
+func TestDifferentDigestClickKeepsTheLiveDedupEntry(t *testing.T) {
+	h := newHarness(t, digestA)
+	h.applier.gate = make(chan struct{})
+
+	first, _, err := h.engine.Deploy(t.Context(), "web", digestB, "admin")
+	if err != nil {
+		t.Fatalf("Deploy: %v", err)
+	}
+	other, otherJoined, err := h.engine.Deploy(t.Context(), "web", digestC, "admin")
+	if err != nil {
+		t.Fatalf("Deploy to %s: %v", digestC, err)
+	}
+	if otherJoined || other == first {
+		t.Fatalf("a different digest was joined onto the live run: id=%d joined=%v",
+			other, otherJoined)
+	}
+	rejoin, rejoinJoined, err := h.engine.Deploy(t.Context(), "web", digestB, "admin")
+	if err != nil {
+		t.Fatalf("rejoin Deploy: %v", err)
+	}
+	if rejoin != first || !rejoinJoined {
+		t.Fatalf("the live run lost its dedup entry: got id=%d joined=%v, want id=%d joined",
+			rejoin, rejoinJoined, first)
+	}
+	close(h.applier.gate)
+	h.engine.Wait()
+}
+
+// The click-time sync moved into the run so the click is visible before the
+// fetch; a failed fetch must fail the row with the repository's own words,
+// never the transport error, which can quote a credential-bearing URL.
+func TestSyncFailureFailsTheRunWithoutLeakingTheError(t *testing.T) {
+	h := newHarness(t, digestA)
+	h.repo.mu.Lock()
+	h.repo.syncErr = fmt.Errorf(
+		"clone https://x-access-token:ghs_synthetic_never_real@github.com/acme/config.git: %w",
+		gitops.ErrCredentialUnavailable)
+	h.repo.mu.Unlock()
+
+	id, _, err := h.engine.Deploy(t.Context(), "web", digestB, "admin")
+	if err != nil {
+		t.Fatalf("Deploy: %v", err)
+	}
+	h.waitTerminal(t)
+
+	e := h.entry(t, id)
+	if e.State != journal.StateFailed {
+		t.Fatalf("state = %q (%s), want failed", e.State, e.Detail)
+	}
+	if strings.Contains(e.Detail, "ghs_synthetic_never_real") {
+		t.Errorf("the raw sync error reached the journal: %q", e.Detail)
+	}
+	if !strings.Contains(e.Detail, "could not be fetched") {
+		t.Errorf("detail lost the repository's own reason: %q", e.Detail)
+	}
+	if !strings.Contains(e.Detail, "unsealed") {
+		t.Errorf("a credential failure did not name its remedy: %q", e.Detail)
+	}
+	opened, _, _ := h.pr.snapshot()
+	if len(opened) != 0 {
+		t.Errorf("a deploy that could not sync opened a proposal: %d", len(opened))
 	}
 }
 
@@ -1051,12 +1195,12 @@ func landedWhileQueued(t *testing.T, h *harness) int64 {
 	}
 	h.pr.mu.Unlock()
 
-	if _, err := h.engine.Deploy(t.Context(), "api", digestB, "admin"); err != nil {
+	if _, _, err := h.engine.Deploy(t.Context(), "api", digestB, "admin"); err != nil {
 		t.Fatalf("Deploy api: %v", err)
 	}
 	<-firstOpen
 
-	id, err := h.engine.Deploy(t.Context(), "web", digestB, "admin")
+	id, _, err := h.engine.Deploy(t.Context(), "web", digestB, "admin")
 	if err != nil {
 		t.Fatalf("Deploy web: %v", err)
 	}

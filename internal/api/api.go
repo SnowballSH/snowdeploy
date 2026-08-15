@@ -42,10 +42,12 @@ const statusRevisionBudget = 1500 * time.Millisecond
 
 var digestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 
-// Engine is the deploy machinery the API drives.
+// Engine is the deploy machinery the API drives. The bool is joined: the
+// request matched a run already carrying the same digest and was answered
+// with its journal id instead of starting a second one.
 type Engine interface {
-	Deploy(ctx context.Context, service, digest, actor string) (int64, error)
-	Rollback(ctx context.Context, service, toDigest, actor string) (int64, error)
+	Deploy(ctx context.Context, service, digest, actor string) (int64, bool, error)
+	Rollback(ctx context.Context, service, toDigest, actor string) (int64, bool, error)
 	Drift(ctx context.Context) (map[string]string, error)
 	QueueDepth() int64
 }
@@ -380,7 +382,7 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request, actor stri
 		writeError(w, http.StatusBadRequest, errors.New("digest is required"))
 		return
 	}
-	s.dispatch(w, r, func() (int64, error) {
+	s.dispatch(w, r, func() (int64, bool, error) {
 		return s.opts.Engine.Deploy(r.Context(), name, req.Digest, actor)
 	})
 }
@@ -394,18 +396,35 @@ func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request, actor st
 	if !ok {
 		return
 	}
-	s.dispatch(w, r, func() (int64, error) {
+	s.dispatch(w, r, func() (int64, bool, error) {
 		return s.opts.Engine.Rollback(r.Context(), name, req.Digest, actor)
 	})
 }
 
-func (s *Server) dispatch(w http.ResponseWriter, _ *http.Request, run func() (int64, error)) {
-	id, err := run()
+// accepted is the body of a 202: the journal id to follow, and whether the
+// click joined a run already carrying the same digest instead of starting one.
+type accepted struct {
+	JournalID int64 `json:"journalId"`
+	Joined    bool  `json:"joined"`
+}
+
+func (s *Server) dispatch(w http.ResponseWriter, _ *http.Request, run func() (int64, bool, error)) {
+	id, joined, err := run()
 	if err != nil {
+		// An engine error that grew out of a failed sync embeds whatever the
+		// Git transport said, remote URL included — the same leak
+		// handleServices closes for reads. The client gets the repository's
+		// own reason; everything else is a plain validation failure.
+		if synced, reason := s.opts.Repo.SyncState(); !synced ||
+			strings.Contains(err.Error(), "sync configuration repository:") {
+			slog.Warn("deploy request failed on configuration sync", "error", err)
+			writeUnavailable(w, synced, reason)
+			return
+		}
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	writeJSON(w, http.StatusAccepted, map[string]int64{"journalId": id})
+	writeJSON(w, http.StatusAccepted, accepted{JournalID: id, Joined: joined})
 }
 
 // service resolves and validates the path's service name against the merged

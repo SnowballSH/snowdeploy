@@ -23,9 +23,13 @@ var ErrAlreadyAtDigest = errors.New("service is already pinned to that digest")
 
 var digestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 
-// ConfigRepo is the merged-state mirror the engine reads.
+// ConfigRepo is the merged-state mirror the engine reads. SyncState exists
+// because the error Sync returns can quote the remote URL — somewhere a
+// credential can hide — while SyncState's reason is the repository's own safe
+// vocabulary, fit for a journal detail every client reads.
 type ConfigRepo interface {
 	Sync(ctx context.Context) (string, error)
+	SyncState() (synced bool, reason error)
 	Manifest(service string) (*manifest.Manifest, []byte, error)
 	Template(name string) (string, error)
 	Services() ([]string, error)
@@ -143,23 +147,28 @@ func (e *Engine) Wait() { e.inFlight.Wait() }
 func (e *Engine) QueueDepth() int64 { return e.queued.Load() }
 
 // Deploy pins a service to a digest. It returns as soon as the journal entry
-// exists; progress arrives as events.
-func (e *Engine) Deploy(ctx context.Context, service, digest, actor string) (int64, error) {
+// exists; progress arrives as events. joined reports that the click matched a
+// run already carrying the same digest and was answered with its id.
+func (e *Engine) Deploy(
+	_ context.Context, service, digest, actor string,
+) (id int64, joined bool, err error) {
 	if !digestPattern.MatchString(digest) {
-		return 0, fmt.Errorf("%q is not a sha256 digest pin", digest)
+		return 0, false, fmt.Errorf("%q is not a sha256 digest pin", digest)
 	}
-	return e.start(ctx, journal.ActionDeploy, service, actor,
+	return e.start(journal.ActionDeploy, service, actor,
 		func(string) (string, error) { return digest, nil })
 }
 
 // Rollback re-pins a service to a previous digest. With no explicit target it
 // uses the newest healthy digest that is not the one currently pinned — the
 // digest the operator means by "roll back", not the one already running.
-func (e *Engine) Rollback(ctx context.Context, service, toDigest, actor string) (int64, error) {
+func (e *Engine) Rollback(
+	_ context.Context, service, toDigest, actor string,
+) (id int64, joined bool, err error) {
 	if toDigest != "" && !digestPattern.MatchString(toDigest) {
-		return 0, fmt.Errorf("%q is not a sha256 digest pin", toDigest)
+		return 0, false, fmt.Errorf("%q is not a sha256 digest pin", toDigest)
 	}
-	return e.start(ctx, journal.ActionRollback, service, actor,
+	return e.start(journal.ActionRollback, service, actor,
 		func(current string) (string, error) {
 			if toDigest != "" {
 				return toDigest, nil
@@ -171,45 +180,48 @@ func (e *Engine) Rollback(ctx context.Context, service, toDigest, actor string) 
 // resolveTarget turns a request into the digest to pin, given what is pinned.
 type resolveTarget func(currentDigest string) (string, error)
 
+// start validates the request against the mirror as it stands and journals
+// the run. It deliberately does not sync first: the fetch can take seconds or
+// hang on an unreachable remote, and nothing would be visible anywhere until
+// it finished. The run itself syncs as its first act, after the click already
+// has a journal row and a detected event to show for itself.
 func (e *Engine) start(
-	ctx context.Context, action, service, actor string, resolve resolveTarget,
-) (int64, error) {
-	if _, err := e.opts.Repo.Sync(ctx); err != nil {
-		return 0, fmt.Errorf("sync configuration repository: %w", err)
-	}
+	action, service, actor string, resolve resolveTarget,
+) (int64, bool, error) {
 	current, raw, err := e.opts.Repo.Manifest(service)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 
 	digest, err := resolve(current.Image.Digest)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	if !digestPattern.MatchString(digest) {
-		return 0, fmt.Errorf("%q is not a sha256 digest pin", digest)
+		return 0, false, fmt.Errorf("%q is not a sha256 digest pin", digest)
 	}
 	if current.Image.Digest == digest {
-		return 0, fmt.Errorf("%s: %w (%s)", service, ErrAlreadyAtDigest, digest)
+		return 0, false, fmt.Errorf("%s: %w (%s)", service, ErrAlreadyAtDigest, digest)
 	}
 
 	newContent, err := setDigest(raw, current.Image.Digest, digest)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 
 	// A second click for a target already queued or running is the same
 	// intent, not a second deploy: answer with the run that is already
-	// carrying it. Without this, a deploy waiting its turn in the merge
-	// queue is silently joined by a duplicate that later proposes an empty
-	// change and fails on it.
+	// carrying it. The check, the journal write, and the registration are one
+	// critical section — with the lock dropped around Begin, two identical
+	// clicks both pass the check and both journal a run, and the second
+	// registration would orphan the first's entry mid-flight. Begin is one
+	// fast local SQLite write, cheap enough to hold the lock across.
 	e.mu.Lock()
-	if pending, ok := e.pending[service]; ok && pending.digest == digest {
+	pending, live := e.pending[service]
+	if live && pending.digest == digest {
 		e.mu.Unlock()
-		return pending.id, nil
+		return pending.id, true, nil
 	}
-	e.mu.Unlock()
-
 	id, err := e.opts.Journal.Begin(journal.Entry{
 		Service:   service,
 		Action:    action,
@@ -220,11 +232,15 @@ func (e *Engine) start(
 		StartedAt: time.Now().UTC(),
 	})
 	if err != nil {
-		return 0, err
+		e.mu.Unlock()
+		return 0, false, err
 	}
-
-	e.mu.Lock()
-	e.pending[service] = pendingRun{digest: digest, id: id}
+	// A live entry for a different digest is not ours to overwrite: it is the
+	// dedup point for every click still matching it. This run proceeds to the
+	// queue unregistered and simply offers no join point of its own.
+	if !live {
+		e.pending[service] = pendingRun{digest: digest, id: id}
+	}
 	e.mu.Unlock()
 
 	e.inFlight.Add(1)
@@ -247,7 +263,7 @@ func (e *Engine) start(
 			newContent:  newContent,
 		})
 	}()
-	return id, nil
+	return id, false, nil
 }
 
 // pendingRun is a deploy that has a journal entry but has not yet finished.
@@ -280,14 +296,24 @@ type runRequest struct {
 func (e *Engine) run(req runRequest) {
 	ctx := e.baseCtx
 
-	// The click must become visible before any queue is waited on: a deploy
-	// parked behind another service's merge span used to render nothing at
-	// all, which read as a dead button and invited duplicate clicks.
-	e.emit(req, StateDetected, "queued for the merge queue")
+	// The click must become visible before the fetch and before any queue is
+	// waited on: a deploy parked behind a slow remote or another service's
+	// merge span used to render nothing at all, which read as a dead button
+	// and invited duplicate clicks.
+	e.emit(req, StateDetected, "reading the configuration repository")
+	if _, err := e.opts.Repo.Sync(ctx); err != nil {
+		e.fail(req, e.syncFailure(err))
+		return
+	}
 
+	e.emit(req, StateDetected, "queued for the merge queue")
 	release, err := e.lock(ctx, req.service)
 	if err != nil {
-		e.fail(req, fmt.Sprintf("queued deploy abandoned: %v", err))
+		detail := fmt.Sprintf("queued deploy abandoned: %v", err)
+		if errors.Is(err, context.Canceled) {
+			detail += "; the daemon was restarting; re-run"
+		}
+		e.fail(req, detail)
 		return
 	}
 	defer release()
@@ -445,10 +471,25 @@ func (e *Engine) mergeThroughChecks(
 	return "", fmt.Errorf("merge failed after %d attempts: %w", mergeAttempts, lastErr)
 }
 
+// syncFailure words a failed sync for the journal and the stream. The error
+// itself never travels: a Git transport error quotes the remote URL, and a
+// URL is somewhere a credential can hide. What travels is the repository's
+// own reason, plus the remedy when the failure names one.
+func (e *Engine) syncFailure(err error) string {
+	detail := "the configuration repository could not be read"
+	if _, reason := e.opts.Repo.SyncState(); reason != nil {
+		detail = reason.Error()
+	}
+	if errors.Is(err, gitops.ErrCredentialUnavailable) {
+		detail += "; re-run once the secret store is unsealed"
+	}
+	return detail
+}
+
 // applyMerged pulls the merged branch and walks it onto the host.
 func (e *Engine) applyMerged(ctx context.Context, req runRequest) error {
 	if _, err := e.opts.Repo.Sync(ctx); err != nil {
-		return fmt.Errorf("sync merged state: %w", err)
+		return fmt.Errorf("sync merged state: %s", e.syncFailure(err))
 	}
 	m, _, err := e.opts.Repo.Manifest(req.service)
 	if err != nil {

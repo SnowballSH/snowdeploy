@@ -37,31 +37,32 @@ type deployCall struct {
 }
 
 type fakeEngine struct {
-	mu    sync.Mutex
-	calls []deployCall
-	err   error
-	drift map[string]string
-	queue int64
+	mu     sync.Mutex
+	calls  []deployCall
+	err    error
+	joined bool
+	drift  map[string]string
+	queue  int64
 }
 
-func (e *fakeEngine) Deploy(_ context.Context, service, digest, actor string) (int64, error) {
+func (e *fakeEngine) Deploy(_ context.Context, service, digest, actor string) (int64, bool, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.calls = append(e.calls, deployCall{service, digest, actor, "deploy"})
 	if e.err != nil {
-		return 0, e.err
+		return 0, false, e.err
 	}
-	return int64(len(e.calls)), nil
+	return int64(len(e.calls)), e.joined, nil
 }
 
-func (e *fakeEngine) Rollback(_ context.Context, service, digest, actor string) (int64, error) {
+func (e *fakeEngine) Rollback(_ context.Context, service, digest, actor string) (int64, bool, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.calls = append(e.calls, deployCall{service, digest, actor, "rollback"})
 	if e.err != nil {
-		return 0, e.err
+		return 0, false, e.err
 	}
-	return int64(len(e.calls)), nil
+	return int64(len(e.calls)), e.joined, nil
 }
 
 func (e *fakeEngine) Drift(context.Context) (map[string]string, error) {
@@ -537,6 +538,7 @@ func TestDeployPassesTheDigestThrough(t *testing.T) {
 
 	var body struct {
 		JournalID int64 `json:"journalId"`
+		Joined    bool  `json:"joined"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		t.Fatalf("decode: %v", err)
@@ -544,10 +546,39 @@ func TestDeployPassesTheDigestThrough(t *testing.T) {
 	if body.JournalID == 0 {
 		t.Error("no journal id returned")
 	}
+	if body.Joined {
+		t.Error("a fresh deploy claimed to have joined an existing one")
+	}
 
 	calls := h.engine.recorded()
 	if calls[0].Service != "web" || calls[0].Digest != digestLatest {
 		t.Errorf("engine call = %+v", calls[0])
+	}
+}
+
+// A click that matched a run already carrying the same digest is answered
+// with that run's id; the joined flag is how a client knows to say "joined an
+// existing deploy" instead of "started one".
+func TestJoinedDeployIsReportedAsJoined(t *testing.T) {
+	h := newHarness(t)
+	h.engine.mu.Lock()
+	h.engine.joined = true
+	h.engine.mu.Unlock()
+
+	resp := h.do(t, http.MethodPost, "/api/v1/services/web/deploy",
+		`{"digest":"`+digestLatest+`"}`, remoteUser("admin"))
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("deploy = %d, want 202", resp.StatusCode)
+	}
+	var body struct {
+		JournalID int64 `json:"journalId"`
+		Joined    bool  `json:"joined"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !body.Joined {
+		t.Error("the joined flag was lost between the engine and the client")
 	}
 }
 
@@ -700,6 +731,50 @@ func TestTheSyncErrorTextNeverReachesTheClient(t *testing.T) {
 		if detail := errorField(t, resp); strings.Contains(detail, syntheticToken) {
 			t.Errorf("GET %s echoed the raw sync error to the client: %q", path, detail)
 		}
+	}
+}
+
+// The POST path has the same exposure as the reads: an engine error that grew
+// out of a failed sync embeds whatever the Git transport said, remote URL
+// included. The client gets the repository's own reason and a gateway status,
+// never the error text.
+func TestTheSyncErrorTextNeverReachesTheDeployClient(t *testing.T) {
+	h := newHarnessWithRepo(t, staleRepo{})
+	h.engine.mu.Lock()
+	h.engine.err = fmt.Errorf(
+		"sync configuration repository: fetch main: https://x-access-token:%s@github.com/acme/config.git: unreachable",
+		syntheticToken)
+	h.engine.mu.Unlock()
+
+	resp := h.do(t, http.MethodPost, "/api/v1/services/web/deploy",
+		`{"digest":"`+digestLatest+`"}`, remoteUser("admin"))
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("deploy over a failing sync = %d, want 502", resp.StatusCode)
+	}
+	detail := errorField(t, resp)
+	if strings.Contains(detail, syntheticToken) {
+		t.Errorf("the raw sync error reached the client: %q", detail)
+	}
+	if !strings.Contains(detail, "could not be fetched") {
+		t.Errorf("error body does not carry the repository's own reason: %q", detail)
+	}
+}
+
+// An engine error that is not a sync failure stays a plain 400 with its own
+// text: validation answers are the client's to read.
+func TestValidationErrorsStillReachTheDeployClient(t *testing.T) {
+	h := newHarness(t)
+	h.engine.mu.Lock()
+	h.engine.err = errors.New("service is already pinned to that digest")
+	h.engine.mu.Unlock()
+
+	resp := h.do(t, http.MethodPost, "/api/v1/services/web/deploy",
+		`{"digest":"`+digestLatest+`"}`, remoteUser("admin"))
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("validation error = %d, want 400", resp.StatusCode)
+	}
+	if detail := errorField(t, resp); !strings.Contains(detail, "already pinned") {
+		t.Errorf("validation detail lost: %q", detail)
 	}
 }
 
