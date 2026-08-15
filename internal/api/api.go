@@ -8,14 +8,17 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 
 	"github.com/SnowballSH/snowdeploy/internal/deploy"
 	"github.com/SnowballSH/snowdeploy/internal/journal"
 	"github.com/SnowballSH/snowdeploy/internal/manifest"
+	"github.com/SnowballSH/snowdeploy/internal/revision"
 )
 
 // defaultHistory bounds an unqualified history request.
@@ -23,6 +26,12 @@ const defaultHistory = 20
 
 // maxHistory bounds a caller-supplied one.
 const maxHistory = 200
+
+// maxRevisionDigests bounds one revisions request. A service page legitimately
+// asks about a screenful of history at once, never hundreds.
+const maxRevisionDigests = 40
+
+var digestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 
 // Engine is the deploy machinery the API drives.
 type Engine interface {
@@ -58,15 +67,18 @@ type History interface {
 	Recent(service string, n int) ([]journal.Entry, error)
 }
 
-// ServiceStatus is one row of the service list.
+// ServiceStatus is one row of the service list. Revisions maps each of the
+// row's digests to the commit that built it, and only carries the ones a
+// lookup actually answered.
 type ServiceStatus struct {
-	Name            string         `json:"name"`
-	Repository      string         `json:"repository"`
-	ManifestDigest  string         `json:"manifestDigest"`
-	RunningDigest   string         `json:"runningDigest"`
-	LatestAvailable string         `json:"latestAvailable"`
-	Drifted         bool           `json:"drifted"`
-	LastDeploy      *journal.Entry `json:"lastDeploy,omitempty"`
+	Name            string                       `json:"name"`
+	Repository      string                       `json:"repository"`
+	ManifestDigest  string                       `json:"manifestDigest"`
+	RunningDigest   string                       `json:"runningDigest"`
+	LatestAvailable string                       `json:"latestAvailable"`
+	Drifted         bool                         `json:"drifted"`
+	LastDeploy      *journal.Entry               `json:"lastDeploy,omitempty"`
+	Revisions       map[string]revision.Revision `json:"revisions,omitempty"`
 }
 
 // Options are the server's dependencies.
@@ -78,6 +90,10 @@ type Options struct {
 	History          History
 	CLITokenHashFile string
 	UI               http.Handler
+
+	// Revisions resolves a digest to the commit that built it. Nil is allowed:
+	// status rows and the revisions endpoint then simply omit revision data.
+	Revisions revision.Source
 }
 
 // Server is the API. Publish feeds it the engine's events.
@@ -137,6 +153,7 @@ func (s *Server) Handler() http.Handler {
 
 	mux.Handle("GET /api/v1/services", s.authed(s.handleServices))
 	mux.Handle("GET /api/v1/services/{name}/history", s.authed(s.handleHistory))
+	mux.Handle("GET /api/v1/services/{name}/revisions", s.authed(s.handleRevisions))
 	mux.Handle("POST /api/v1/services/{name}/deploy", s.authed(s.handleDeploy))
 	mux.Handle("POST /api/v1/services/{name}/rollback", s.authed(s.handleRollback))
 	mux.Handle("GET /api/v1/events", s.authed(func(w http.ResponseWriter, r *http.Request, _ string) {
@@ -222,7 +239,36 @@ func (s *Server) status(ctx context.Context, name string) ServiceStatus {
 		entry := recent[0]
 		st.LastDeploy = &entry
 	}
+	st.Revisions = s.resolveRevisions(ctx, st.Repository,
+		[]string{st.ManifestDigest, st.RunningDigest, st.LatestAvailable})
 	return st
+}
+
+// resolveRevisions answers what is known about each digest, deduplicated. A
+// digest nothing could be learned about is left out rather than carried as an
+// empty object: absence is the honest answer, not a blank one.
+func (s *Server) resolveRevisions(
+	ctx context.Context, repository string, digests []string,
+) map[string]revision.Revision {
+	if s.opts.Revisions == nil {
+		return nil
+	}
+	out := make(map[string]revision.Revision)
+	for _, digest := range digests {
+		if digest == "" {
+			continue
+		}
+		if _, done := out[digest]; done {
+			continue
+		}
+		if rev, ok := s.opts.Revisions.Lookup(ctx, repository, digest); ok {
+			out[digest] = rev
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request, _ string) {
@@ -250,6 +296,48 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request, _ string)
 		entries = []journal.Entry{}
 	}
 	writeJSON(w, http.StatusOK, entries)
+}
+
+// handleRevisions maps the caller's digests to the commits that built them.
+// It exists so the history view can annotate old digests without the /history
+// response shape ever changing — a pinned CLI parses that one. Unknown digests
+// are omitted from the answer, never errors: an unlabelled image is a normal
+// image.
+func (s *Server) handleRevisions(w http.ResponseWriter, r *http.Request, _ string) {
+	name, ok := s.service(w, r)
+	if !ok {
+		return
+	}
+
+	raw := r.URL.Query().Get("digests")
+	if raw == "" {
+		writeError(w, http.StatusBadRequest, errors.New("digests is required"))
+		return
+	}
+	digests := strings.Split(raw, ",")
+	if len(digests) > maxRevisionDigests {
+		writeError(w, http.StatusBadRequest, fmt.Errorf(
+			"at most %d digests per request", maxRevisionDigests))
+		return
+	}
+	for _, digest := range digests {
+		if !digestPattern.MatchString(digest) {
+			writeError(w, http.StatusBadRequest, fmt.Errorf(
+				"%q is not a sha256 digest", digest))
+			return
+		}
+	}
+
+	m, _, err := s.opts.Repo.Manifest(name)
+	if err != nil {
+		writeError(w, http.StatusNotFound, errors.New("no such service"))
+		return
+	}
+	out := s.resolveRevisions(r.Context(), m.Image.Repository, digests)
+	if out == nil {
+		out = map[string]revision.Revision{}
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 type digestRequest struct {

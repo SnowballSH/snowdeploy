@@ -20,6 +20,7 @@ import (
 	"github.com/SnowballSH/snowdeploy/internal/deploy"
 	"github.com/SnowballSH/snowdeploy/internal/journal"
 	"github.com/SnowballSH/snowdeploy/internal/manifest"
+	"github.com/SnowballSH/snowdeploy/internal/revision"
 )
 
 const (
@@ -136,6 +137,29 @@ func (fakeWatcher) Latest(repository string) (string, bool) {
 	return "", false
 }
 
+// fakeRevisions knows the manifest and latest digests but not the running one,
+// standing in for an image whose provenance labels never got stamped.
+type fakeRevisions struct{}
+
+func (fakeRevisions) Lookup(_ context.Context, _, digest string) (revision.Revision, bool) {
+	switch digest {
+	case digestManifest:
+		return revision.Revision{
+			SHA:     "1111abc",
+			URL:     "https://github.com/acme/web/commit/1111abc",
+			Subject: "pin the manifest digest",
+		}, true
+	case digestLatest:
+		return revision.Revision{
+			SHA:     "3333abc",
+			URL:     "https://github.com/acme/web/commit/3333abc",
+			Subject: "the newest build",
+		}, true
+	default:
+		return revision.Revision{}, false
+	}
+}
+
 type harness struct {
 	srv    *httptest.Server
 	engine *fakeEngine
@@ -146,10 +170,15 @@ type harness struct {
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
-	return newHarnessWithRepo(t, fakeRepo{})
+	return newHarnessWithSource(t, fakeRepo{}, fakeRevisions{})
 }
 
 func newHarnessWithRepo(t *testing.T, repo Repo) *harness {
+	t.Helper()
+	return newHarnessWithSource(t, repo, fakeRevisions{})
+}
+
+func newHarnessWithSource(t *testing.T, repo Repo, revisions revision.Source) *harness {
 	t.Helper()
 
 	j, err := journal.Open(filepath.Join(t.TempDir(), "j.db"))
@@ -174,6 +203,7 @@ func newHarnessWithRepo(t *testing.T, repo Repo) *harness {
 		Watcher:          fakeWatcher{},
 		History:          j,
 		CLITokenHashFile: hashFile,
+		Revisions:        revisions,
 	})
 
 	srv := httptest.NewServer(api.Handler())
@@ -311,6 +341,146 @@ func TestServicesListing(t *testing.T) {
 	if s.Name != "web" || s.ManifestDigest != digestManifest ||
 		s.RunningDigest != digestRunning || s.LatestAvailable != digestLatest {
 		t.Errorf("service status = %+v", s)
+	}
+}
+
+// The status row annotates only the digests something is known about: the
+// running digest's image carries no labels, and inventing an empty revision
+// for it would make "unlabelled" indistinguishable from "labelled as empty".
+func TestServiceStatusCarriesRevisionsForKnownDigestsOnly(t *testing.T) {
+	h := newHarness(t)
+	resp := h.do(t, http.MethodGet, "/api/v1/services", "", remoteUser("admin"))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /services = %d", resp.StatusCode)
+	}
+
+	var got []ServiceStatus
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	revs := got[0].Revisions
+	if len(revs) != 2 {
+		t.Fatalf("revisions = %+v, want the manifest and latest digests only", revs)
+	}
+	if revs[digestManifest].SHA != "1111abc" || revs[digestManifest].Subject == "" {
+		t.Errorf("manifest revision = %+v", revs[digestManifest])
+	}
+	if revs[digestLatest].SHA != "3333abc" {
+		t.Errorf("latest revision = %+v", revs[digestLatest])
+	}
+	if _, present := revs[digestRunning]; present {
+		t.Error("an unknown digest was given a revision entry")
+	}
+}
+
+// ---- the revisions endpoint ------------------------------------------------
+
+func TestRevisionsEndpointMapsKnownDigestsAndOmitsTheRest(t *testing.T) {
+	h := newHarness(t)
+	resp := h.do(t, http.MethodGet,
+		"/api/v1/services/web/revisions?digests="+digestManifest+","+digestRunning,
+		"", remoteUser("admin"))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /revisions = %d", resp.StatusCode)
+	}
+
+	var got map[string]revision.Revision
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("revisions = %+v, want the one known digest", got)
+	}
+	rev := got[digestManifest]
+	if rev.SHA != "1111abc" || rev.URL == "" || rev.Subject == "" {
+		t.Errorf("revision = %+v", rev)
+	}
+}
+
+func TestRevisionsEndpointRequiresAuth(t *testing.T) {
+	h := newHarness(t)
+	resp := h.do(t, http.MethodGet,
+		"/api/v1/services/web/revisions?digests="+digestManifest, "", nil)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated revisions = %d, want 401", resp.StatusCode)
+	}
+}
+
+func TestRevisionsEndpointValidatesItsDigests(t *testing.T) {
+	h := newHarness(t)
+	for name, query := range map[string]string{
+		"missing param":  "",
+		"not a digest":   "?digests=latest",
+		"crafted digest": "?digests=sha256:" + strings.Repeat("g", 64),
+		"empty entry":    "?digests=" + digestManifest + ",",
+	} {
+		resp := h.do(t, http.MethodGet, "/api/v1/services/web/revisions"+query,
+			"", remoteUser("admin"))
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("%s = %d, want 400", name, resp.StatusCode)
+		}
+	}
+}
+
+func TestRevisionsEndpointCapsTheDigestCount(t *testing.T) {
+	h := newHarness(t)
+
+	digests := make([]string, 0, maxRevisionDigests+1)
+	for range maxRevisionDigests + 1 {
+		digests = append(digests, digestManifest)
+	}
+	resp := h.do(t, http.MethodGet,
+		"/api/v1/services/web/revisions?digests="+strings.Join(digests, ","),
+		"", remoteUser("admin"))
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("%d digests = %d, want 400", maxRevisionDigests+1, resp.StatusCode)
+	}
+
+	resp = h.do(t, http.MethodGet,
+		"/api/v1/services/web/revisions?digests="+strings.Join(digests[1:], ","),
+		"", remoteUser("admin"))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("%d digests = %d, want 200", maxRevisionDigests, resp.StatusCode)
+	}
+}
+
+func TestRevisionsEndpointRejectsAnUnknownService(t *testing.T) {
+	h := newHarness(t)
+	resp := h.do(t, http.MethodGet,
+		"/api/v1/services/nope/revisions?digests="+digestManifest, "", remoteUser("admin"))
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("unknown service = %d, want 404", resp.StatusCode)
+	}
+}
+
+// A daemon built without a revision source must degrade to plain digests
+// everywhere, never panic: the field is decoration, not a dependency.
+func TestNilRevisionSourceDegradesToAbsentFields(t *testing.T) {
+	h := newHarnessWithSource(t, fakeRepo{}, nil)
+
+	resp := h.do(t, http.MethodGet, "/api/v1/services", "", remoteUser("admin"))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /services = %d", resp.StatusCode)
+	}
+	var services []ServiceStatus
+	if err := json.NewDecoder(resp.Body).Decode(&services); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if services[0].Revisions != nil {
+		t.Errorf("revisions invented without a source: %+v", services[0].Revisions)
+	}
+
+	resp = h.do(t, http.MethodGet,
+		"/api/v1/services/web/revisions?digests="+digestManifest, "", remoteUser("admin"))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /revisions = %d, want 200", resp.StatusCode)
+	}
+	var got map[string]revision.Revision
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("revisions = %+v, want an empty map", got)
 	}
 }
 

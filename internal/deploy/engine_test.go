@@ -19,6 +19,8 @@ const (
 	digestA = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	digestB = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	digestC = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+
+	testRepoWebURL = "https://github.com/acme/config"
 )
 
 func manifestYAML(digest string) string {
@@ -265,6 +267,7 @@ func newHarness(t *testing.T, startDigest string) *harness {
 		CheckPoll:      time.Millisecond,
 		RevertAttempts: 3,
 		RevertBackoff:  time.Millisecond,
+		RepoWebURL:     testRepoWebURL,
 	})
 	t.Cleanup(h.engine.Wait)
 	return h
@@ -287,6 +290,12 @@ func (h *harness) reset() {
 	h.done = make(chan struct{})
 	h.closed = false
 	h.events = nil
+}
+
+func (h *harness) eventList() []Event {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]Event(nil), h.events...)
 }
 
 func (h *harness) states() []string {
@@ -388,6 +397,34 @@ func TestDeployHappyPathStateSequence(t *testing.T) {
 	}
 	if len(closed) != 0 {
 		t.Errorf("a successful deploy closed a PR: %v", closed)
+	}
+}
+
+// A client that joins the stream mid-deploy still needs the links, so once
+// the run learns its pull request and merge commit, every later event carries
+// them — not just the transition that announced them.
+func TestEventsCarryThePullRequestTrail(t *testing.T) {
+	h := newHarness(t, digestA)
+
+	if _, err := h.engine.Deploy(t.Context(), "web", digestB, "admin"); err != nil {
+		t.Fatalf("Deploy: %v", err)
+	}
+	h.waitTerminal(t)
+
+	wantPRURL := testRepoWebURL + "/pull/1"
+	wantMergeURL := testRepoWebURL + "/commit/mergesha1"
+	for _, ev := range h.eventList() {
+		if ev.PRNumber != 1 || ev.PRURL != wantPRURL {
+			t.Errorf("%s event pr trail = #%d %q, want #1 %q",
+				ev.State, ev.PRNumber, ev.PRURL, wantPRURL)
+		}
+		merged := ev.State != StatePROpen && ev.State != StateChecks
+		if merged && ev.MergeURL != wantMergeURL {
+			t.Errorf("%s event merge url = %q, want %q", ev.State, ev.MergeURL, wantMergeURL)
+		}
+		if !merged && ev.MergeURL != "" {
+			t.Errorf("%s event carries a merge url before the merge: %q", ev.State, ev.MergeURL)
+		}
 	}
 }
 

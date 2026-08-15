@@ -24,6 +24,7 @@ import (
 	"github.com/SnowballSH/snowdeploy/internal/journal"
 	"github.com/SnowballSH/snowdeploy/internal/reconcile"
 	"github.com/SnowballSH/snowdeploy/internal/registry"
+	"github.com/SnowballSH/snowdeploy/internal/revision"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -138,7 +139,8 @@ func build(ctx context.Context, cfg *config.Config) (*daemon, error) {
 				server.Publish(ev)
 			}
 		},
-		CheckPoll: cfg.CheckPollInterval,
+		CheckPoll:  cfg.CheckPollInterval,
+		RepoWebURL: "https://github.com/" + cfg.GitHubOwner + "/" + cfg.GitHubRepo,
 	})
 	server = api.New(api.Options{
 		Engine:           engine,
@@ -148,6 +150,7 @@ func build(ctx context.Context, cfg *config.Config) (*daemon, error) {
 		History:          jrnl,
 		CLITokenHashFile: cfg.CLITokenHashFile,
 		UI:               api.UI(),
+		Revisions:        revision.NewOCI(),
 	})
 
 	// A registry that stops answering offers no deploy, which on its own is

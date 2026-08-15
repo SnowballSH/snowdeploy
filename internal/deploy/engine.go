@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -51,12 +52,17 @@ type Inspector interface {
 	RunningImage(ctx context.Context, service string) (string, error)
 }
 
-// Event is one state transition, streamed live to the UI and CLI.
+// Event is one state transition, streamed live to the UI and CLI. The pull
+// request and merge fields appear as soon as a run learns them and ride on
+// every later event, so a client that joined mid-deploy still gets the links.
 type Event struct {
 	Service   string    `json:"service"`
 	State     string    `json:"state"`
 	Detail    string    `json:"detail"`
 	JournalID int64     `json:"journalId"`
+	PRNumber  int       `json:"prNumber,omitempty"`
+	PRURL     string    `json:"prUrl,omitempty"`
+	MergeURL  string    `json:"mergeUrl,omitempty"`
 	At        time.Time `json:"at"`
 }
 
@@ -71,6 +77,11 @@ type Options struct {
 	CheckPoll      time.Duration
 	RevertAttempts int
 	RevertBackoff  time.Duration
+
+	// RepoWebURL is the configuration repository's web address, for example
+	// "https://github.com/acme/config". Events derive their pull-request and
+	// merge-commit links from it; empty simply leaves the links off.
+	RepoWebURL string
 }
 
 // Engine runs one deploy per service at a time.
@@ -205,6 +216,12 @@ type runRequest struct {
 	newDigest   string
 	originalRaw []byte
 	newContent  []byte
+
+	// The pull-request trail, filled in as run learns it. Living on the
+	// request means every later emit carries it without re-reading the journal.
+	prNumber int
+	prURL    string
+	mergeURL string
 }
 
 func (e *Engine) run(req runRequest) {
@@ -227,6 +244,10 @@ func (e *Engine) run(req runRequest) {
 	if err := e.opts.Journal.SetPR(req.id, prNumber); err != nil {
 		e.fail(req, fmt.Sprintf("could not record the pull request: %v", err))
 		return
+	}
+	req.prNumber = prNumber
+	if e.opts.RepoWebURL != "" {
+		req.prURL = e.opts.RepoWebURL + "/pull/" + strconv.Itoa(prNumber)
 	}
 	e.emit(req, StatePROpen, fmt.Sprintf("pull request #%d opened", prNumber))
 
@@ -251,6 +272,9 @@ func (e *Engine) run(req runRequest) {
 	if err := e.opts.Journal.SetMergeSHA(req.id, mergeSHA); err != nil {
 		e.fail(req, fmt.Sprintf("could not record the merge: %v", err))
 		return
+	}
+	if e.opts.RepoWebURL != "" {
+		req.mergeURL = e.opts.RepoWebURL + "/commit/" + mergeSHA
 	}
 	e.emit(req, StateMerged, "merged as "+mergeSHA)
 
@@ -419,24 +443,25 @@ func (e *Engine) lock(ctx context.Context, service string) (func(), error) {
 
 func (e *Engine) emit(req runRequest, state, detail string) {
 	_ = e.opts.Journal.Progress(req.id, state, detail)
-	e.notify(Event{
-		Service:   req.service,
-		State:     state,
-		Detail:    detail,
-		JournalID: req.id,
-		At:        time.Now().UTC(),
-	})
+	e.notify(event(req, state, detail))
 }
 
 func (e *Engine) finish(req runRequest, state, detail string) {
 	_ = e.opts.Journal.Finish(req.id, state, detail)
-	e.notify(Event{
+	e.notify(event(req, state, detail))
+}
+
+func event(req runRequest, state, detail string) Event {
+	return Event{
 		Service:   req.service,
 		State:     state,
 		Detail:    detail,
 		JournalID: req.id,
+		PRNumber:  req.prNumber,
+		PRURL:     req.prURL,
+		MergeURL:  req.mergeURL,
 		At:        time.Now().UTC(),
-	})
+	}
 }
 
 func (e *Engine) fail(req runRequest, detail string) {
