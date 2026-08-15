@@ -174,13 +174,24 @@ func (f *fakeDaemon) handler(t *testing.T) http.Handler {
 			"runningDigest":   "sha256:aaa",
 			"latestAvailable": "bbb",
 			"drifted":         false,
+			"repoWebUrl":      "https://github.com/acme/config",
+			"revisions": map[string]any{
+				"sha256:aaa": map[string]any{
+					"sha": "abc1234", "subject": "pin the good build",
+				},
+			},
+			"lastDeploy": map[string]any{
+				"ID": 9, "Service": "web", "Action": "deploy", "Actor": "admin",
+				"NewDigest": "sha256:aaa", "PRNumber": 12, "State": "checks",
+				"StartedAt": time.Now().UTC(),
+			},
 		}})
 	})
 
 	mux.HandleFunc("GET /api/v1/services/{name}/history", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(t, w, []map[string]any{{
 			"ID": 1, "Service": "web", "Action": "deploy", "Actor": "admin",
-			"NewDigest": "bbb", "State": "healthy",
+			"NewDigest": "bbb", "PRNumber": 42, "MergeSHA": "deadbeef", "State": "healthy",
 			"StartedAt": time.Now().UTC(), "FinishedAt": time.Now().UTC(),
 		}})
 	})
@@ -277,6 +288,23 @@ func TestStatusPrintsATable(t *testing.T) {
 	}
 }
 
+// The daemon serves a lastDeploy without a receipt and the commit subject
+// behind the pinned digest; status must show both, so an operator sees a run
+// in flight and a change, not a hash.
+func TestStatusShowsInFlightStateAndCommitSubject(t *testing.T) {
+	_, url := newFakeDaemon(t)
+	code, c := runCLI("status", "--server", url)
+	if code != 0 {
+		t.Fatalf("exit = %d: %s", code, c.err.String())
+	}
+	if !strings.Contains(c.out.String(), "deploy in flight (checks)") {
+		t.Errorf("status hides the run in flight:\n%s", c.out.String())
+	}
+	if !strings.Contains(c.out.String(), "pin the good build") {
+		t.Errorf("status output missing the commit subject:\n%s", c.out.String())
+	}
+}
+
 func TestDeployPostsDigestAndFollowsToHealthy(t *testing.T) {
 	f, url := newFakeDaemon(t,
 		"pr-open", "checks", "merged", "reconciling", "probing", "healthy")
@@ -353,6 +381,9 @@ func TestHistoryPrintsEntries(t *testing.T) {
 	}
 	if !strings.Contains(c.out.String(), "healthy") {
 		t.Errorf("history output:\n%s", c.out.String())
+	}
+	if !strings.Contains(c.out.String(), "#42") {
+		t.Errorf("history output missing the pull request number:\n%s", c.out.String())
 	}
 }
 

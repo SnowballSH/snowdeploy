@@ -234,6 +234,9 @@ func (a *fakeApplier) Apply(
 	err := a.failOn[m.Image.Digest]
 	a.mu.Unlock()
 
+	if onPhase != nil {
+		onPhase(reconcile.PhaseRestarting)
+	}
 	if gate != nil {
 		<-gate
 	}
@@ -405,7 +408,7 @@ func TestDeployHappyPathStateSequence(t *testing.T) {
 
 	want := []string{
 		StateDetected, StateDetected, StatePROpen, StateChecks, StateMerged,
-		StateReconciling, StateProbing, StateHealthy,
+		StateReconciling, StateReconciling, StateProbing, StateHealthy,
 	}
 	got := h.states()
 	if len(got) != len(want) {
@@ -415,6 +418,15 @@ func TestDeployHappyPathStateSequence(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("state %d = %q, want %q (full: %v)", i, got[i], want[i], got)
 		}
+	}
+	var sawRestarting bool
+	for _, ev := range h.eventList() {
+		if ev.State == StateReconciling && strings.Contains(ev.Detail, "restarting web") {
+			sawRestarting = true
+		}
+	}
+	if !sawRestarting {
+		t.Error("the restart phase was silent: no reconciling event says it is restarting")
 	}
 
 	e := h.entry(t, id)
@@ -525,6 +537,9 @@ func TestFailedChecksNeverTouchTheHost(t *testing.T) {
 	}
 	if !strings.Contains(e.Detail, "verify") {
 		t.Errorf("journal detail lost the reason: %q", e.Detail)
+	}
+	if !strings.Contains(e.Detail, "#1") {
+		t.Errorf("a red check does not point at its pull request: %q", e.Detail)
 	}
 }
 

@@ -148,17 +148,26 @@ func cmdStatus(ctx context.Context, args []string, stdout io.Writer) error {
 	}
 
 	tw := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "SERVICE\tRUNNING\tMANIFEST\tLATEST\tSTATE")
+	fmt.Fprintln(tw, "SERVICE\tRUNNING\tMANIFEST\tLATEST\tSTATE\tCOMMIT")
 	for _, s := range services {
+		// A run without a receipt outranks every static comparison: while it
+		// is in flight, drift is expected and "update available" is stale.
 		state := "in sync"
-		if s.Drifted {
+		switch {
+		case s.LastDeploy.inFlight():
+			state = fmt.Sprintf("%s in flight (%s)", s.LastDeploy.Action, s.LastDeploy.State)
+		case s.Drifted:
 			state = "DRIFTED"
-		} else if s.LatestAvailable != "" && s.LatestAvailable != s.ManifestDigest {
+		case s.LatestAvailable != "" && s.LatestAvailable != s.ManifestDigest:
 			state = "update available"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n",
+		subject := "-"
+		if rev, ok := s.Revisions[s.ManifestDigest]; ok && rev.Subject != "" {
+			subject = truncate(rev.Subject, 50)
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
 			s.Name, short(s.RunningDigest), short(s.ManifestDigest),
-			short(s.LatestAvailable), state)
+			short(s.LatestAvailable), state, subject)
 	}
 	return tw.Flush()
 }
@@ -278,11 +287,15 @@ func cmdHistory(ctx context.Context, args []string, stdout io.Writer) error {
 	}
 
 	tw := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "WHEN\tACTION\tACTOR\tDIGEST\tSTATE\tDETAIL")
+	fmt.Fprintln(tw, "WHEN\tACTION\tACTOR\tDIGEST\tPR\tSTATE\tDETAIL")
 	for _, e := range entries {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
+		pr := "-"
+		if e.PRNumber > 0 {
+			pr = fmt.Sprintf("#%d", e.PRNumber)
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			e.StartedAt.Local().Format(time.RFC3339), e.Action, e.Actor,
-			short(e.NewDigest), e.State, truncate(e.Detail, 60))
+			short(e.NewDigest), pr, e.State, truncate(e.Detail, 60))
 	}
 	return tw.Flush()
 }

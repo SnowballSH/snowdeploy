@@ -231,9 +231,16 @@ func (r *Repo) Template(name string) (string, error) {
 	return string(raw), nil
 }
 
+// Reads hold the mirror lock for the whole filesystem access, not just the
+// synced-flag check: Sync hard-resets and cleans the working tree, and a read
+// that raced it could see a file mid-replacement — half one commit, half
+// another — which no commit ever contained.
+
 // Services lists the manifests present in the mirror, sorted.
 func (r *Repo) Services() ([]string, error) {
-	if err := r.requireSynced(); err != nil {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if err := r.requireSyncedLocked(); err != nil {
 		return nil, err
 	}
 	entries, err := os.ReadDir(filepath.Join(r.cfg.CacheDir, r.cfg.ManifestDir))
@@ -253,7 +260,9 @@ func (r *Repo) Services() ([]string, error) {
 }
 
 func (r *Repo) readRelative(dir, file, nameForCheck string) ([]byte, error) {
-	if err := r.requireSynced(); err != nil {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if err := r.requireSyncedLocked(); err != nil {
 		return nil, err
 	}
 	if err := checkName(nameForCheck); err != nil {
@@ -267,12 +276,17 @@ func (r *Repo) readRelative(dir, file, nameForCheck string) ([]byte, error) {
 	return raw, nil
 }
 
-// requireSynced refuses a read of a mirror that was never populated, and says
-// why in the same words the API reports, so a manifest that is missing because
-// nothing was ever fetched never reads as a manifest that does not exist.
-func (r *Repo) requireSynced() error {
-	if synced, reason := r.SyncState(); !synced {
-		return reason
+// requireSyncedLocked refuses a read of a mirror that was never populated,
+// and says why in the same words the API reports, so a manifest that is
+// missing because nothing was ever fetched never reads as a manifest that
+// does not exist. The caller holds r.mu; taking it again here would deadlock
+// against a writer already waiting.
+func (r *Repo) requireSyncedLocked() error {
+	if !r.synced && r.failure == nil {
+		return ErrNeverSynced
+	}
+	if !r.synced {
+		return r.failure
 	}
 	return nil
 }

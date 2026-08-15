@@ -124,12 +124,24 @@ func describe(resp *http.Response) string {
 
 // serviceStatus mirrors the API's service row.
 type serviceStatus struct {
-	Name            string `json:"name"`
-	Repository      string `json:"repository"`
-	ManifestDigest  string `json:"manifestDigest"`
-	RunningDigest   string `json:"runningDigest"`
-	LatestAvailable string `json:"latestAvailable"`
-	Drifted         bool   `json:"drifted"`
+	Name              string              `json:"name"`
+	Repository        string              `json:"repository"`
+	ManifestDigest    string              `json:"manifestDigest"`
+	RunningDigest     string              `json:"runningDigest"`
+	LatestAvailable   string              `json:"latestAvailable"`
+	Drifted           bool                `json:"drifted"`
+	RegistryReachable bool                `json:"registryReachable"`
+	LatestCheckedAt   time.Time           `json:"latestCheckedAt"`
+	RepoWebURL        string              `json:"repoWebUrl"`
+	LastDeploy        *historyEntry       `json:"lastDeploy"`
+	Revisions         map[string]revision `json:"revisions"`
+}
+
+// revision mirrors what the API knows about the commit behind a digest.
+type revision struct {
+	SHA     string `json:"sha"`
+	URL     string `json:"url"`
+	Subject string `json:"subject"`
 }
 
 // historyEntry mirrors the API's journal entry.
@@ -138,19 +150,30 @@ type historyEntry struct {
 	Service    string    `json:"Service"`
 	Action     string    `json:"Action"`
 	Actor      string    `json:"Actor"`
+	OldDigest  string    `json:"OldDigest"`
 	NewDigest  string    `json:"NewDigest"`
+	PRNumber   int       `json:"PRNumber"`
+	MergeSHA   string    `json:"MergeSHA"`
 	State      string    `json:"State"`
 	Detail     string    `json:"Detail"`
 	StartedAt  time.Time `json:"StartedAt"`
 	FinishedAt time.Time `json:"FinishedAt"`
 }
 
+// inFlight reports whether the entry describes a run still without a receipt.
+func (e *historyEntry) inFlight() bool {
+	return e != nil && e.FinishedAt.IsZero()
+}
+
 // event mirrors a streamed state transition.
 type event struct {
 	Service   string `json:"service"`
+	Action    string `json:"action"`
 	State     string `json:"state"`
 	Detail    string `json:"detail"`
 	JournalID int64  `json:"journalId"`
+	PRURL     string `json:"prUrl"`
+	MergeURL  string `json:"mergeUrl"`
 }
 
 func (c *client) services(ctx context.Context) ([]serviceStatus, error) {

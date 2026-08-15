@@ -318,7 +318,7 @@ func (e *Engine) run(req runRequest) {
 	}
 	defer release()
 
-	e.mergeMu.Lock()
+	e.lockMergeQueue()
 
 	// The manifest this run froze at click time is stale by the time it
 	// reaches the front of the queue: other deploys landed while it waited.
@@ -445,7 +445,7 @@ func (e *Engine) mergeThroughChecks(
 			return "", fmt.Errorf("checks could not be read: %w", err)
 		}
 		if !ok {
-			return "", errors.New(detail)
+			return "", fmt.Errorf("%s; see pull request #%d", detail, prNumber)
 		}
 		mergeSHA, err := e.opts.PR.Merge(ctx, prNumber)
 		if err == nil {
@@ -504,7 +504,11 @@ func (e *Engine) applyMerged(ctx context.Context, req runRequest) error {
 		return err
 	}
 	return e.opts.Applier.Apply(ctx, m, tmpl, func(phase string) {
-		if phase == reconcile.PhaseProbing {
+		switch phase {
+		case reconcile.PhaseRestarting:
+			e.emit(req, StateReconciling, fmt.Sprintf(
+				"restarting %s (pulling image)", req.service))
+		case reconcile.PhaseProbing:
 			e.emit(req, StateProbing, "probing "+m.Health.URL)
 		}
 	})
@@ -585,7 +589,7 @@ func (e *Engine) revertMain(ctx context.Context, req *runRequest) error {
 }
 
 func (e *Engine) revertOnce(ctx context.Context, req *runRequest) error {
-	e.mergeMu.Lock()
+	e.lockMergeQueue()
 	defer e.mergeMu.Unlock()
 	prNumber, err := e.opts.PR.OpenManifestPR(ctx, req.service, req.originalRaw,
 		fmt.Sprintf("revert %s to %s", req.service, shortDigest(req.oldDigest)),
@@ -637,6 +641,16 @@ func (e *Engine) Drift(ctx context.Context) (map[string]string, error) {
 }
 
 // ---- plumbing --------------------------------------------------------------
+
+// lockMergeQueue takes the cross-service merge lock, counting the wait in
+// the same gauge as the per-service queue: a deploy parked behind another
+// service's merge span is queued in every sense the gauge's reader cares
+// about, and it used to wait there invisibly.
+func (e *Engine) lockMergeQueue() {
+	e.queued.Add(1)
+	defer e.queued.Add(-1)
+	e.mergeMu.Lock()
+}
 
 // lock serializes deploys per service. Later requests queue rather than race.
 func (e *Engine) lock(ctx context.Context, service string) (func(), error) {
