@@ -18,6 +18,7 @@ type metrics struct {
 	deploys       *prometheus.CounterVec
 	stateDuration *prometheus.HistogramVec
 	drift         *prometheus.GaugeVec
+	registryPolls *prometheus.CounterVec
 
 	mu        sync.Mutex
 	lastState map[int64]stateMark
@@ -44,11 +45,17 @@ func newMetrics(queueDepth func() float64) *metrics {
 			Name: "snowdeploy_drift",
 			Help: "1 when a service's running image differs from its merged manifest.",
 		}, []string{"service"}),
+		// The outcome is a label, never the error text: a resolve failure can
+		// carry a URL, and every scraper reads a label.
+		registryPolls: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "snowdeploy_registry_polls_total",
+			Help: "Registry tag resolutions by repository and outcome.",
+		}, []string{"repository", "outcome"}),
 		lastState: make(map[int64]stateMark),
 	}
 
 	m.registry.MustRegister(
-		m.deploys, m.stateDuration, m.drift,
+		m.deploys, m.stateDuration, m.drift, m.registryPolls,
 		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 			Name: "snowdeploy_queue_depth",
 			Help: "Deploy requests waiting on a per-service lock.",
@@ -87,6 +94,18 @@ func (m *metrics) observe(ev deploy.Event) {
 	if isTerminalState(ev.State) {
 		m.deploys.WithLabelValues(ev.Service, ev.State).Inc()
 	}
+}
+
+// recordRegistryPoll counts one resolve. A watcher that stops being able to
+// answer otherwise looks exactly like a watcher with nothing new to offer, so
+// this counter is the only thing that separates "no new image" from "no
+// registry".
+func (m *metrics) recordRegistryPoll(repository string, err error) {
+	outcome := "ok"
+	if err != nil {
+		outcome = "error"
+	}
+	m.registryPolls.WithLabelValues(repository, outcome).Inc()
 }
 
 // setDrift republishes the whole drift picture, so a service that stops

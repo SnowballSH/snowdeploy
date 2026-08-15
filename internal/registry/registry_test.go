@@ -167,3 +167,84 @@ func TestAllReturnsSnapshot(t *testing.T) {
 		t.Fatal("All() returned the live map, not a copy")
 	}
 }
+
+// A watcher whose every poll fails looks, from outside, exactly like a watcher
+// with nothing new to offer: Latest keeps answering the previous digest and no
+// caller learns the registry went away. These two prove the outcome of every
+// poll is reported, so the daemon can log it and count it.
+func TestObserverIsToldEveryFailedPoll(t *testing.T) {
+	r := &fakeResolver{digests: map[string]string{}}
+	r.fail(errors.New("registry unreachable"))
+	w := NewWatcher(r, time.Millisecond)
+
+	var mu sync.Mutex
+	failures := map[string]string{}
+	w.SetObserver(func(repository string, err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			failures[repository] = err.Error()
+		}
+	})
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go w.Run(ctx, func() []string { return []string{"repo"} })
+
+	waitFor(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return failures["repo"] != ""
+	})
+	mu.Lock()
+	defer mu.Unlock()
+	if got := failures["repo"]; got == "" {
+		t.Fatal("a failing poll was never reported")
+	}
+}
+
+func TestObserverIsToldEverySuccessfulPoll(t *testing.T) {
+	r := &fakeResolver{digests: map[string]string{"repo": "sha256:one"}}
+	w := NewWatcher(r, time.Millisecond)
+
+	var mu sync.Mutex
+	var successes int
+	var sawError bool
+	w.SetObserver(func(_ string, err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			sawError = true
+			return
+		}
+		successes++
+	})
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go w.Run(ctx, func() []string { return []string{"repo"} })
+
+	waitFor(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return successes > 0
+	})
+	mu.Lock()
+	defer mu.Unlock()
+	if sawError {
+		t.Error("a successful poll was reported as an error")
+	}
+}
+
+// A watcher with no observer must still poll: the observer is a report, not a
+// dependency.
+func TestWatcherPollsWithoutAnObserver(t *testing.T) {
+	r := &fakeResolver{digests: map[string]string{"repo": "sha256:one"}}
+	w := NewWatcher(r, time.Millisecond)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go w.Run(ctx, func() []string { return []string{"repo"} })
+
+	waitFor(t, func() bool { _, ok := w.Latest("repo"); return ok })
+}
