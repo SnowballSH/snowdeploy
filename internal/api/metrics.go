@@ -19,6 +19,7 @@ type metrics struct {
 	stateDuration *prometheus.HistogramVec
 	drift         *prometheus.GaugeVec
 	registryPolls *prometheus.CounterVec
+	droppedEvents prometheus.Counter
 
 	mu        sync.Mutex
 	lastState map[int64]stateMark
@@ -51,14 +52,20 @@ func newMetrics(queueDepth func() float64) *metrics {
 			Name: "snowdeploy_registry_polls_total",
 			Help: "Registry tag resolutions by repository and outcome.",
 		}, []string{"repository", "outcome"}),
+		// A subscriber that falls behind loses events by design; this counter
+		// is the only place those losses add up to something an alert can read.
+		droppedEvents: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "snowdeploy_events_dropped_total",
+			Help: "Events dropped because a stream subscriber fell behind.",
+		}),
 		lastState: make(map[int64]stateMark),
 	}
 
 	m.registry.MustRegister(
-		m.deploys, m.stateDuration, m.drift, m.registryPolls,
+		m.deploys, m.stateDuration, m.drift, m.registryPolls, m.droppedEvents,
 		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 			Name: "snowdeploy_queue_depth",
-			Help: "Deploy requests waiting on a per-service lock.",
+			Help: "Deploy requests waiting on a per-service lock or the merge queue.",
 		}, queueDepth),
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),

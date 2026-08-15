@@ -20,6 +20,7 @@ import (
 	"github.com/SnowballSH/snowdeploy/internal/deploy"
 	"github.com/SnowballSH/snowdeploy/internal/journal"
 	"github.com/SnowballSH/snowdeploy/internal/manifest"
+	"github.com/SnowballSH/snowdeploy/internal/registry"
 	"github.com/SnowballSH/snowdeploy/internal/revision"
 )
 
@@ -27,6 +28,8 @@ const (
 	digestManifest = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
 	digestRunning  = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
 	digestLatest   = "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+
+	testRepoWebURL = "https://github.com/acme/config"
 )
 
 type deployCall struct {
@@ -138,6 +141,15 @@ func (fakeWatcher) Latest(repository string) (string, bool) {
 	return "", false
 }
 
+var watcherCheckedAt = time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC)
+
+func (fakeWatcher) LastPoll(repository string) (registry.PollStatus, bool) {
+	if repository == "registry.example.com/acme/web" {
+		return registry.PollStatus{At: watcherCheckedAt}, true
+	}
+	return registry.PollStatus{}, false
+}
+
 // fakeRevisions knows the manifest and latest digests but not the running one,
 // standing in for an image whose provenance labels never got stamped.
 type fakeRevisions struct{}
@@ -205,6 +217,7 @@ func newHarnessWithSource(t *testing.T, repo Repo, revisions revision.Source) *h
 		History:          j,
 		CLITokenHashFile: hashFile,
 		Revisions:        revisions,
+		RepoWebURL:       testRepoWebURL,
 	})
 
 	srv := httptest.NewServer(api.Handler())
@@ -342,6 +355,13 @@ func TestServicesListing(t *testing.T) {
 	if s.Name != "web" || s.ManifestDigest != digestManifest ||
 		s.RunningDigest != digestRunning || s.LatestAvailable != digestLatest {
 		t.Errorf("service status = %+v", s)
+	}
+	if !s.RegistryReachable || !s.LatestCheckedAt.Equal(watcherCheckedAt) {
+		t.Errorf("registry poll status lost: reachable=%v checkedAt=%v",
+			s.RegistryReachable, s.LatestCheckedAt)
+	}
+	if s.RepoWebURL != testRepoWebURL {
+		t.Errorf("repoWebUrl = %q, want %q", s.RepoWebURL, testRepoWebURL)
 	}
 }
 
@@ -874,6 +894,158 @@ func TestEventsStreamDeliversEngineEvents(t *testing.T) {
 		return
 	}
 	t.Fatalf("no SSE data frame arrived: %v", scanner.Err())
+}
+
+// openEventStream connects and returns a scanner over the stream plus the
+// response for cleanup.
+func openEventStream(t *testing.T, h *harness) *bufio.Scanner {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	t.Cleanup(cancel)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, h.srv.URL+"/api/v1/events", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Remote-User", "admin")
+	resp, err := h.srv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("connect to events: %v", err)
+	}
+	t.Cleanup(func() { _ = resp.Body.Close() })
+	return bufio.NewScanner(resp.Body)
+}
+
+// A page opened mid-deploy used to show nothing until the next transition
+// happened to arrive. The stream now opens with one synthetic frame per
+// service whose newest journal row is still in flight, links included.
+func TestEventsStreamSendsASnapshotOfInFlightRuns(t *testing.T) {
+	h := newHarness(t)
+	id, err := h.jrnl.Begin(journal.Entry{
+		Service: "web", Action: journal.ActionDeploy, Actor: "admin",
+		NewDigest: digestLatest, PRNumber: 12, MergeSHA: "abc123",
+		State: deploy.StateChecks, Detail: "waiting for checks",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	scanner := openEventStream(t, h)
+	var lastID string
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "id: ") {
+			lastID = strings.TrimPrefix(line, "id: ")
+			continue
+		}
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		var ev deploy.Event
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &ev); err != nil {
+			t.Fatalf("decode SSE frame %q: %v", line, err)
+		}
+		if ev.JournalID != id || ev.State != deploy.StateChecks || ev.Service != "web" {
+			t.Fatalf("snapshot frame = %+v", ev)
+		}
+		if ev.Action != journal.ActionDeploy {
+			t.Errorf("snapshot frame lost the action: %+v", ev)
+		}
+		if want := testRepoWebURL + "/pull/12"; ev.PRURL != want {
+			t.Errorf("snapshot pr url = %q, want %q", ev.PRURL, want)
+		}
+		if want := testRepoWebURL + "/commit/abc123"; ev.MergeURL != want {
+			t.Errorf("snapshot merge url = %q, want %q", ev.MergeURL, want)
+		}
+		if want := fmt.Sprintf("%d-1", id); lastID != want {
+			t.Errorf("frame id = %q, want %q", lastID, want)
+		}
+		return
+	}
+	t.Fatalf("no snapshot frame arrived: %v", scanner.Err())
+}
+
+// A finished row is history, not state: the snapshot must skip it, so the
+// first frame a fresh connection sees is the next live transition.
+func TestEventsStreamSkipsFinishedRunsInTheSnapshot(t *testing.T) {
+	h := newHarness(t)
+	id, err := h.jrnl.Begin(journal.Entry{
+		Service: "web", Action: journal.ActionDeploy, Actor: "admin",
+		NewDigest: digestLatest, State: deploy.StateChecks,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.jrnl.Finish(id, journal.StateHealthy, "done"); err != nil {
+		t.Fatal(err)
+	}
+
+	scanner := openEventStream(t, h)
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			h.api.Publish(deploy.Event{
+				Service: "web", State: deploy.StateProbing, JournalID: 42,
+				At: time.Now().UTC(),
+			})
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		var ev deploy.Event
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &ev); err != nil {
+			t.Fatalf("decode SSE frame %q: %v", line, err)
+		}
+		if ev.JournalID == id {
+			t.Fatalf("a finished run was snapshot as in flight: %+v", ev)
+		}
+		if ev.JournalID == 42 {
+			return
+		}
+	}
+	t.Fatalf("no live frame arrived: %v", scanner.Err())
+}
+
+// A subscriber that falls behind loses events by design; the losses must add
+// up somewhere an alert can read, and the log must say it once, not once per
+// dropped event.
+func TestDroppedEventsAreCounted(t *testing.T) {
+	h := newHarness(t)
+
+	_, unsubscribe := h.api.broker.subscribe()
+	defer unsubscribe()
+
+	const published = subscriberBuffer + 10
+	for range published {
+		h.api.Publish(deploy.Event{Service: "web", State: deploy.StateChecks, JournalID: 1})
+	}
+
+	msrv := httptest.NewServer(h.api.MetricsHandler())
+	defer msrv.Close()
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, msrv.URL+"/metrics", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := msrv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("scrape: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	want := fmt.Sprintf("snowdeploy_events_dropped_total %d", published-subscriberBuffer)
+	if body := readAll(t, resp); !strings.Contains(body, want) {
+		t.Errorf("metrics missing %q", want)
+	}
 }
 
 func TestPublishWithNoSubscribersDoesNotBlock(t *testing.T) {

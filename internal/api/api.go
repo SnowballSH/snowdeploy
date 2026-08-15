@@ -20,6 +20,7 @@ import (
 	"github.com/SnowballSH/snowdeploy/internal/deploy"
 	"github.com/SnowballSH/snowdeploy/internal/journal"
 	"github.com/SnowballSH/snowdeploy/internal/manifest"
+	"github.com/SnowballSH/snowdeploy/internal/registry"
 	"github.com/SnowballSH/snowdeploy/internal/revision"
 )
 
@@ -68,9 +69,11 @@ type Inspector interface {
 	RunningImage(ctx context.Context, service string) (string, error)
 }
 
-// Watcher reports the newest digest a registry offers.
+// Watcher reports the newest digest a registry offers, and how the last
+// attempt to ask went.
 type Watcher interface {
 	Latest(repository string) (string, bool)
+	LastPoll(repository string) (registry.PollStatus, bool)
 }
 
 // History reads deploy receipts.
@@ -90,6 +93,17 @@ type ServiceStatus struct {
 	Drifted         bool                         `json:"drifted"`
 	LastDeploy      *journal.Entry               `json:"lastDeploy,omitempty"`
 	Revisions       map[string]revision.Revision `json:"revisions,omitempty"`
+
+	// RegistryReachable distinguishes "no new image" from "no registry":
+	// without it a registry outage renders as nothing new to offer, forever.
+	// It is meaningful only when LatestCheckedAt is set — before the first
+	// poll completes there is no verdict either way.
+	RegistryReachable bool      `json:"registryReachable"`
+	LatestCheckedAt   time.Time `json:"latestCheckedAt,omitzero"`
+
+	// RepoWebURL lets a client build pull-request and commit links for
+	// journal-sourced rows the same way the event stream does.
+	RepoWebURL string `json:"repoWebUrl,omitempty"`
 }
 
 // Options are the server's dependencies.
@@ -101,6 +115,10 @@ type Options struct {
 	History          History
 	CLITokenHashFile string
 	UI               http.Handler
+
+	// RepoWebURL is the configuration repository's web address, threaded to
+	// clients and used to rebuild event links for snapshot frames.
+	RepoWebURL string
 
 	// Revisions resolves a digest to the commit that built it. Nil is allowed:
 	// status rows and the revisions endpoint then simply omit revision data.
@@ -118,9 +136,8 @@ type Server struct {
 // New builds the server.
 func New(opts Options) *Server {
 	s := &Server{
-		opts:   opts,
-		auth:   &authenticator{tokenHashFile: opts.CLITokenHashFile},
-		broker: newBroker(),
+		opts: opts,
+		auth: &authenticator{tokenHashFile: opts.CLITokenHashFile},
 	}
 	s.metrics = newMetrics(func() float64 {
 		if opts.Engine == nil {
@@ -128,6 +145,7 @@ func New(opts Options) *Server {
 		}
 		return float64(opts.Engine.QueueDepth())
 	})
+	s.broker = newBroker(s.metrics.droppedEvents.Inc)
 	return s
 }
 
@@ -246,6 +264,11 @@ func (s *Server) status(ctx context.Context, name string) ServiceStatus {
 	if latest, ok := s.opts.Watcher.Latest(m.Image.Repository); ok {
 		st.LatestAvailable = latest
 	}
+	if poll, ok := s.opts.Watcher.LastPoll(m.Image.Repository); ok {
+		st.RegistryReachable = poll.Err == nil
+		st.LatestCheckedAt = poll.At
+	}
+	st.RepoWebURL = s.opts.RepoWebURL
 	if recent, err := s.opts.History.Recent(name, 1); err == nil && len(recent) > 0 {
 		entry := recent[0]
 		st.LastDeploy = &entry

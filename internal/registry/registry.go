@@ -59,7 +59,15 @@ type Watcher struct {
 
 	mu       sync.RWMutex
 	latest   map[string]string
+	polls    map[string]PollStatus
 	observer PollObserver
+}
+
+// PollStatus is the outcome of a repository's most recent poll. Err carries
+// the failure; a nil Err with a non-zero At is a registry that answered.
+type PollStatus struct {
+	At  time.Time
+	Err error
 }
 
 // NewWatcher builds a watcher polling every interval.
@@ -72,6 +80,7 @@ func NewWatcher(r Resolver, interval time.Duration) *Watcher {
 		interval: interval,
 		tag:      DefaultTag,
 		latest:   make(map[string]string),
+		polls:    make(map[string]PollStatus),
 	}
 }
 
@@ -88,6 +97,16 @@ func (w *Watcher) Latest(repository string) (string, bool) {
 	defer w.mu.RUnlock()
 	d, ok := w.latest[repository]
 	return d, ok
+}
+
+// LastPoll reports when a repository was last asked about and how it went.
+// A failed poll leaves Latest standing but is visible here: the stale digest
+// keeps being offered, and this is what says it might be stale.
+func (w *Watcher) LastPoll(repository string) (PollStatus, bool) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	s, ok := w.polls[repository]
+	return s, ok
 }
 
 // All returns a copy of every digest currently known.
@@ -120,11 +139,12 @@ func (w *Watcher) poll(ctx context.Context, repositories []string) {
 			return
 		}
 		digest, err := w.resolver.ResolveDigest(ctx, repo, w.tag)
+		w.mu.Lock()
 		if err == nil {
-			w.mu.Lock()
 			w.latest[repo] = digest
-			w.mu.Unlock()
 		}
+		w.polls[repo] = PollStatus{At: time.Now().UTC(), Err: err}
+		w.mu.Unlock()
 		// Stored before reported, so an observer that turns around and asks
 		// Latest sees the digest this very poll resolved.
 		w.report(repo, err)

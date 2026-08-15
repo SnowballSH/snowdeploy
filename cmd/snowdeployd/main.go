@@ -131,6 +131,8 @@ func build(ctx context.Context, cfg *config.Config) (*daemon, error) {
 	}
 	watcher := registry.NewWatcher(registry.NewOCI(), cfg.PollInterval)
 
+	repoWebURL := "https://github.com/" + cfg.GitHubOwner + "/" + cfg.GitHubRepo
+
 	var server *api.Server
 	engine := deploy.New(ctx, deploy.Options{
 		Repo:      repo,
@@ -144,7 +146,7 @@ func build(ctx context.Context, cfg *config.Config) (*daemon, error) {
 			}
 		},
 		CheckPoll:  cfg.CheckPollInterval,
-		RepoWebURL: "https://github.com/" + cfg.GitHubOwner + "/" + cfg.GitHubRepo,
+		RepoWebURL: repoWebURL,
 	})
 	revisions := revision.NewOCI()
 	server = api.New(api.Options{
@@ -156,6 +158,7 @@ func build(ctx context.Context, cfg *config.Config) (*daemon, error) {
 		CLITokenHashFile: cfg.CLITokenHashFile,
 		UI:               api.UI(),
 		Revisions:        revisions,
+		RepoWebURL:       repoWebURL,
 	})
 
 	// A registry that stops answering offers no deploy, which on its own is

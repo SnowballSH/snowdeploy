@@ -238,6 +238,37 @@ func TestObserverIsToldEverySuccessfulPoll(t *testing.T) {
 	}
 }
 
+// LastPoll is what separates "the registry answered recently" from "the last
+// answer is stale": a failed poll leaves Latest standing, and only LastPoll
+// records that the question stopped being answered.
+func TestLastPollRecordsOutcomeAndRecency(t *testing.T) {
+	f := &fakeResolver{digests: map[string]string{"repo": "sha256:one"}}
+	w := NewWatcher(f, time.Millisecond)
+
+	if _, ok := w.LastPoll("repo"); ok {
+		t.Fatal("an unpolled repository reported a poll status")
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	go w.Run(ctx, func() []string { return []string{"repo"} })
+
+	waitFor(t, func() bool {
+		s, ok := w.LastPoll("repo")
+		return ok && s.Err == nil && !s.At.IsZero()
+	})
+
+	f.fail(errors.New("registry down"))
+	waitFor(t, func() bool {
+		s, ok := w.LastPoll("repo")
+		return ok && s.Err != nil
+	})
+
+	if d, ok := w.Latest("repo"); !ok || d != "sha256:one" {
+		t.Fatalf("Latest after a failed poll = %q, %v; want the previous value kept", d, ok)
+	}
+}
+
 // A watcher with no observer must still poll: the observer is a report, not a
 // dependency.
 func TestWatcherPollsWithoutAnObserver(t *testing.T) {
