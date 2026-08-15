@@ -484,6 +484,41 @@ func TestNilRevisionSourceDegradesToAbsentFields(t *testing.T) {
 	}
 }
 
+// blockingRevisions is a cache that is cold and stays cold: every lookup
+// parks until the caller's context expires and then knows nothing.
+type blockingRevisions struct{}
+
+func (blockingRevisions) Lookup(ctx context.Context, _, _ string) (revision.Revision, bool) {
+	<-ctx.Done()
+	return revision.Revision{}, false
+}
+
+// A cold revision cache must cost a status row one shared budget, not one
+// budget per digest and not the whole fill: the listing answers with plain
+// digests and the annotations appear on a later refresh.
+func TestStatusRevisionLookupsShareOneBudget(t *testing.T) {
+	h := newHarnessWithSource(t, fakeRepo{}, blockingRevisions{})
+
+	start := time.Now()
+	resp := h.do(t, http.MethodGet, "/api/v1/services", "", remoteUser("admin"))
+	elapsed := time.Since(start)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /services = %d", resp.StatusCode)
+	}
+	var services []ServiceStatus
+	if err := json.NewDecoder(resp.Body).Decode(&services); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if services[0].Revisions != nil {
+		t.Errorf("a cold cache produced revisions: %+v", services[0].Revisions)
+	}
+	if elapsed >= 2*statusRevisionBudget {
+		t.Errorf("listing took %v; the row's lookups did not share one %v budget",
+			elapsed, statusRevisionBudget)
+	}
+}
+
 func TestDeployRequiresADigest(t *testing.T) {
 	h := newHarness(t)
 	resp := h.do(t, http.MethodPost, "/api/v1/services/web/deploy", `{}`, remoteUser("admin"))

@@ -39,6 +39,12 @@ const (
 	// does not blind the daemon until a restart.
 	failureRetry = 10 * time.Minute
 
+	// fillTimeout bounds one fill against the registry and GitHub combined.
+	// Fills run detached from the caller's context — a caller's deadline says
+	// how long it will wait, not how long the answer may take to compute — so
+	// the fill needs a bound of its own.
+	fillTimeout = 15 * time.Second
+
 	// maxEntries bounds the cache. Four services' worth of digests cannot
 	// legitimately approach this, so crossing it means the keys are garbage —
 	// and then dropping the whole map is cheaper than choosing survivors.
@@ -97,6 +103,14 @@ type cacheEntry struct {
 // cachedSource remembers every answer. A successful lookup is immutable — a
 // digest's provenance cannot change — so it is kept forever; a failed one is
 // retried after failureRetry.
+//
+// Misses are filled by one detached goroutine per key. Detached, because the
+// caller is typically an HTTP handler whose deadline bounds its wait, not the
+// work: letting an impatient caller abort the fill would also let it
+// negative-cache an answer every patient caller still wants. One goroutine
+// per key, because a status page asks about the same digest from several rows
+// at once, and a thundering herd of anonymous pulls is how a registry decides
+// to rate-limit the daemon.
 type cachedSource struct {
 	fetch     labelFetcher
 	github    *http.Client
@@ -105,6 +119,7 @@ type cachedSource struct {
 
 	mu      sync.Mutex
 	entries map[string]cacheEntry
+	fills   map[string]chan struct{}
 }
 
 func newCached(fetch labelFetcher, github *http.Client, githubAPI string) *cachedSource {
@@ -114,39 +129,73 @@ func newCached(fetch labelFetcher, github *http.Client, githubAPI string) *cache
 		githubAPI: strings.TrimSuffix(githubAPI, "/"),
 		now:       time.Now,
 		entries:   make(map[string]cacheEntry),
+		fills:     make(map[string]chan struct{}),
 	}
 }
 
+// Lookup answers from the cache, joining or starting a background fill on a
+// miss. It gives up with (Revision{}, false) as soon as ctx is done; the fill
+// runs on regardless and caches whatever it learns for the next caller.
 func (s *cachedSource) Lookup(ctx context.Context, repository, digest string) (Revision, bool) {
 	key := repository + "@" + digest
-	if rev, ok, decided := s.cached(key); decided {
-		return rev, ok
+	for {
+		rev, ok, decided, done := s.cachedOrFilling(key, repository, digest)
+		if decided {
+			return rev, ok
+		}
+		select {
+		case <-done:
+			// Loop rather than trust the fill's outcome blindly: re-reading
+			// the cache keeps this correct even if the entry was dropped in a
+			// wholesale reset meanwhile.
+		case <-ctx.Done():
+			return Revision{}, false
+		}
 	}
+}
+
+// cachedOrFilling answers from the cache, or hands back the in-flight fill for
+// the caller to wait on — starting one when nobody has. decided=false means
+// wait on done.
+func (s *cachedSource) cachedOrFilling(
+	key, repository, digest string,
+) (rev Revision, ok, decided bool, done chan struct{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if e, present := s.entries[key]; present {
+		if e.ok {
+			return e.rev, true, true, nil
+		}
+		if s.now().Sub(e.at) < failureRetry {
+			return Revision{}, false, true, nil
+		}
+	}
+	done, filling := s.fills[key]
+	if !filling {
+		done = make(chan struct{})
+		s.fills[key] = done
+		go s.fill(key, repository, digest, done)
+	}
+	return Revision{}, false, false, done
+}
+
+// fill resolves one key under its own bounded context and publishes the
+// outcome. Only its own failure negative-caches; no caller can abort it.
+func (s *cachedSource) fill(key, repository, digest string, done chan struct{}) {
+	ctx, cancel := context.WithTimeout(context.Background(), fillTimeout)
+	defer cancel()
 	rev, ok := s.resolve(ctx, repository, digest)
+
+	s.mu.Lock()
 	s.store(key, rev, ok)
-	return rev, ok
+	delete(s.fills, key)
+	s.mu.Unlock()
+	close(done)
 }
 
-// cached answers from the cache; decided=false means the caller must resolve.
-func (s *cachedSource) cached(key string) (rev Revision, ok, decided bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	e, present := s.entries[key]
-	switch {
-	case !present:
-		return Revision{}, false, false
-	case e.ok:
-		return e.rev, true, true
-	case s.now().Sub(e.at) < failureRetry:
-		return Revision{}, false, true
-	default:
-		return Revision{}, false, false
-	}
-}
-
+// store records an outcome. It must be called with s.mu held.
 func (s *cachedSource) store(key string, rev Revision, ok bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if len(s.entries) >= maxEntries {
 		s.entries = make(map[string]cacheEntry)
 	}

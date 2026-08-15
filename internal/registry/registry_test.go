@@ -94,7 +94,9 @@ func TestResolverErrorKeepsPreviousValue(t *testing.T) {
 	})
 
 	f.fail(errors.New("registry down"))
+	f.mu.Lock()
 	before := f.calls
+	f.mu.Unlock()
 	waitFor(t, func() bool {
 		f.mu.Lock()
 		defer f.mu.Unlock()

@@ -142,6 +142,7 @@ func build(ctx context.Context, cfg *config.Config) (*daemon, error) {
 		CheckPoll:  cfg.CheckPollInterval,
 		RepoWebURL: "https://github.com/" + cfg.GitHubOwner + "/" + cfg.GitHubRepo,
 	})
+	revisions := revision.NewOCI()
 	server = api.New(api.Options{
 		Engine:           engine,
 		Repo:             repo,
@@ -150,7 +151,7 @@ func build(ctx context.Context, cfg *config.Config) (*daemon, error) {
 		History:          jrnl,
 		CLITokenHashFile: cfg.CLITokenHashFile,
 		UI:               api.UI(),
-		Revisions:        revision.NewOCI(),
+		Revisions:        revisions,
 	})
 
 	// A registry that stops answering offers no deploy, which on its own is
@@ -161,6 +162,15 @@ func build(ctx context.Context, cfg *config.Config) (*daemon, error) {
 		if err != nil {
 			slog.Warn("registry poll failed; no new digest can be offered for this repository",
 				"repository", repository, "error", err)
+			return
+		}
+		// Warm the revision cache as digests are discovered, so the commit
+		// behind a digest is usually known before any browser asks. The
+		// source deduplicates in-flight fills and caches success forever, so
+		// re-polling an unchanged digest costs nothing; the answer here is
+		// deliberately discarded — caching it was the point.
+		if digest, ok := watcher.Latest(repository); ok {
+			go revisions.Lookup(ctx, repository, digest)
 		}
 	})
 

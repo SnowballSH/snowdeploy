@@ -14,6 +14,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/SnowballSH/snowdeploy/internal/deploy"
 	"github.com/SnowballSH/snowdeploy/internal/journal"
@@ -30,6 +32,13 @@ const maxHistory = 200
 // maxRevisionDigests bounds one revisions request. A service page legitimately
 // asks about a screenful of history at once, never hundreds.
 const maxRevisionDigests = 40
+
+// statusRevisionBudget is how long one status row waits for its revision
+// lookups, combined. Cache misses keep filling in the background past this
+// deadline, so a cold listing answers fast with whatever is warm and the rest
+// is there on the next refresh — rather than every browser paying a registry
+// round-trip to render a table.
+const statusRevisionBudget = 1500 * time.Millisecond
 
 var digestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 
@@ -239,32 +248,46 @@ func (s *Server) status(ctx context.Context, name string) ServiceStatus {
 		entry := recent[0]
 		st.LastDeploy = &entry
 	}
-	st.Revisions = s.resolveRevisions(ctx, st.Repository,
+	revCtx, cancel := context.WithTimeout(ctx, statusRevisionBudget)
+	defer cancel()
+	st.Revisions = s.resolveRevisions(revCtx, st.Repository,
 		[]string{st.ManifestDigest, st.RunningDigest, st.LatestAvailable})
 	return st
 }
 
-// resolveRevisions answers what is known about each digest, deduplicated. A
-// digest nothing could be learned about is left out rather than carried as an
-// empty object: absence is the honest answer, not a blank one.
+// resolveRevisions answers what is known about each digest, deduplicated. The
+// lookups run concurrently — they share whatever deadline ctx carries, and
+// three digests waiting in series would triple it. A digest nothing could be
+// learned about is left out rather than carried as an empty object: absence is
+// the honest answer, not a blank one.
 func (s *Server) resolveRevisions(
 	ctx context.Context, repository string, digests []string,
 ) map[string]revision.Revision {
 	if s.opts.Revisions == nil {
 		return nil
 	}
-	out := make(map[string]revision.Revision)
+	seen := make(map[string]bool, len(digests))
+	var (
+		mu  sync.Mutex
+		wg  sync.WaitGroup
+		out = make(map[string]revision.Revision)
+	)
 	for _, digest := range digests {
-		if digest == "" {
+		if digest == "" || seen[digest] {
 			continue
 		}
-		if _, done := out[digest]; done {
-			continue
-		}
-		if rev, ok := s.opts.Revisions.Lookup(ctx, repository, digest); ok {
-			out[digest] = rev
-		}
+		seen[digest] = true
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if rev, ok := s.opts.Revisions.Lookup(ctx, repository, digest); ok {
+				mu.Lock()
+				out[digest] = rev
+				mu.Unlock()
+			}
+		}()
 	}
+	wg.Wait()
 	if len(out) == 0 {
 		return nil
 	}

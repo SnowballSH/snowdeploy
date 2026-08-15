@@ -120,13 +120,14 @@ func (w *Watcher) poll(ctx context.Context, repositories []string) {
 			return
 		}
 		digest, err := w.resolver.ResolveDigest(ctx, repo, w.tag)
-		w.report(repo, err)
-		if err != nil {
-			continue
+		if err == nil {
+			w.mu.Lock()
+			w.latest[repo] = digest
+			w.mu.Unlock()
 		}
-		w.mu.Lock()
-		w.latest[repo] = digest
-		w.mu.Unlock()
+		// Stored before reported, so an observer that turns around and asks
+		// Latest sees the digest this very poll resolved.
+		w.report(repo, err)
 	}
 }
 

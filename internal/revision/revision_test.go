@@ -18,18 +18,27 @@ const (
 )
 
 // fakeFetcher hands out per-repository label sets and counts every call, so a
-// test can tell a cache hit from a re-fetch.
+// test can tell a cache hit from a re-fetch. A non-nil gate parks every fetch
+// until it is closed, letting a test hold a fill open.
 type fakeFetcher struct {
 	mu     sync.Mutex
 	labels map[string]map[string]string
 	err    error
 	calls  int
+	gate   chan struct{}
 }
 
 func (f *fakeFetcher) fetch(_ context.Context, repository, _ string) (map[string]string, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.calls++
+	gate := f.gate
+	f.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -274,9 +283,11 @@ func TestFailedLookupIsRetriedOnlyAfterTheBackoff(t *testing.T) {
 
 func TestCacheDropsItselfWhenOverfull(t *testing.T) {
 	h := newHarness(t, githubLabels())
+	h.src.mu.Lock()
 	for i := range maxEntries {
 		h.src.store(fmt.Sprintf("repo%d@sha256:x", i), Revision{}, false)
 	}
+	h.src.mu.Unlock()
 
 	if _, ok := h.lookup(t); !ok {
 		t.Fatal("Lookup failed against a full cache")
@@ -286,6 +297,70 @@ func TestCacheDropsItselfWhenOverfull(t *testing.T) {
 	h.src.mu.Unlock()
 	if size != 1 {
 		t.Errorf("cache size after overflow = %d, want a fresh map with one entry", size)
+	}
+}
+
+// ---- fills -----------------------------------------------------------------
+
+// Several callers asking about the same digest at once must produce one
+// registry fetch, not a stampede of anonymous pulls.
+func TestConcurrentLookupsJoinOneFill(t *testing.T) {
+	h := newHarness(t, githubLabels())
+	gate := make(chan struct{})
+	h.fetcher.gate = gate
+
+	results := make(chan Revision, 2)
+	for range 2 {
+		go func() {
+			rev, ok := h.lookup(t)
+			if !ok {
+				t.Error("joined lookup reported unknown")
+			}
+			results <- rev
+		}()
+	}
+
+	// Both callers must be parked on the same fill before it is released.
+	deadline := time.Now().Add(2 * time.Second)
+	for h.fetcher.callCount() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("no fill ever started")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(10 * time.Millisecond)
+	close(gate)
+
+	for range 2 {
+		if rev := <-results; rev.SHA != testSHA {
+			t.Errorf("joined lookup = %+v", rev)
+		}
+	}
+	if got := h.fetcher.callCount(); got != 1 {
+		t.Errorf("two concurrent lookups cost %d fetches, want one", got)
+	}
+}
+
+// A caller's deadline bounds its wait, never the fill: the answer an impatient
+// caller walked away from must still land in the cache for the next one.
+func TestCallerTimeoutDoesNotAbortTheFill(t *testing.T) {
+	h := newHarness(t, githubLabels())
+	gate := make(chan struct{})
+	h.fetcher.gate = gate
+
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, ok := h.src.Lookup(cancelled, "registry.example.com/acme/web", testDigest); ok {
+		t.Fatal("a cancelled lookup claimed an answer")
+	}
+
+	close(gate)
+	rev, ok := h.lookup(t)
+	if !ok || rev.SHA != testSHA {
+		t.Fatalf("Lookup after the abandoned fill = %+v, %v; want the cached success", rev, ok)
+	}
+	if got := h.fetcher.callCount(); got != 1 {
+		t.Errorf("the abandoned fill was thrown away and re-fetched: %d fetches", got)
 	}
 }
 
