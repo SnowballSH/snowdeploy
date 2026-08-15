@@ -205,10 +205,11 @@ func (p *fakePR) snapshot() ([]prCall, []int, []int) {
 }
 
 type fakeApplier struct {
-	mu      sync.Mutex
-	applied []string
-	failOn  map[string]error
-	gate    chan struct{}
+	mu        sync.Mutex
+	applied   []string
+	appliedBy []string
+	failOn    map[string]error
+	gate      chan struct{}
 }
 
 func (a *fakeApplier) Apply(
@@ -216,6 +217,7 @@ func (a *fakeApplier) Apply(
 ) error {
 	a.mu.Lock()
 	a.applied = append(a.applied, m.Image.Digest)
+	a.appliedBy = append(a.appliedBy, m.Name)
 	gate := a.gate
 	err := a.failOn[m.Image.Digest]
 	a.mu.Unlock()
@@ -233,6 +235,19 @@ func (a *fakeApplier) calls() []string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return append([]string(nil), a.applied...)
+}
+
+// callsFor is the digests applied for one service, in order.
+func (a *fakeApplier) callsFor(name string) []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var out []string
+	for i, digest := range a.applied {
+		if a.appliedBy[i] == name {
+			out = append(out, digest)
+		}
+	}
+	return out
 }
 
 type fakeInspector struct {
@@ -295,6 +310,7 @@ func newHarness(t *testing.T, startDigest string) *harness {
 		CheckPoll:      time.Millisecond,
 		RevertAttempts: 3,
 		RevertBackoff:  time.Millisecond,
+		MergeBackoff:   time.Millisecond,
 		RepoWebURL:     testRepoWebURL,
 	})
 	t.Cleanup(h.engine.Wait)
@@ -539,6 +555,152 @@ func TestProbeFailureRollsBackAndRevertsMain(t *testing.T) {
 	}
 	if !strings.Contains(e.Detail, "healthy") {
 		t.Errorf("journal detail lost the probe failure: %q", e.Detail)
+	}
+
+	// The failed deploy's proposal is merged and done with by the time the
+	// probe fails; an event during the undo that still links it would render
+	// the revert as the deploy walking backwards through "checks".
+	events := h.eventList()
+	probeIdx := -1
+	for i, ev := range events {
+		if ev.State == StateProbing {
+			probeIdx = i
+			break
+		}
+	}
+	if probeIdx == -1 {
+		t.Fatalf("no probing event recorded: %v", h.states())
+	}
+	var sawRestore, sawRevert, sawRevertChecks bool
+	for _, ev := range events[probeIdx+1:] {
+		if ev.PRNumber == 1 {
+			t.Errorf("%s event after probing still links the failed deploy's PR #1 (%q)",
+				ev.State, ev.Detail)
+		}
+		if strings.Contains(ev.Detail, "restoring") {
+			sawRestore = true
+		}
+		if strings.Contains(ev.Detail, "reverting main") {
+			sawRevert = true
+		}
+		if ev.State == StateChecks && ev.PRNumber == 2 {
+			sawRevertChecks = true
+		}
+	}
+	if !sawRestore {
+		t.Error("the host restore was silent: no event says it is restoring the old digest")
+	}
+	if !sawRevert {
+		t.Error("the revert was silent: no event says main is being reverted")
+	}
+	if !sawRevertChecks {
+		t.Error("no checks event links the revert's own pull request")
+	}
+}
+
+// A deploy that waited in the queue must be computed against the manifest as
+// it is when its turn comes, not as it was at click time: the frozen content
+// would silently revert whatever landed in between, and a rollback would
+// restore the click-time digest, undoing an interleaved healthy deploy.
+func TestQueuedDeployProposesAgainstTheManifestAtTheFrontOfTheQueue(t *testing.T) {
+	h := newHarness(t, digestA)
+	h.applier.failOn[digestC] = errors.New("web did not become healthy")
+
+	gate := make(chan struct{})
+	var reached sync.Once
+	firstOpen := make(chan struct{})
+	h.pr.mu.Lock()
+	h.pr.onOpen = func(service string, content []byte) {
+		reached.Do(func() { close(firstOpen) })
+		<-gate
+		h.repo.merge(service, content)
+	}
+	h.pr.mu.Unlock()
+
+	first, err := h.engine.Deploy(t.Context(), "web", digestB, "admin")
+	if err != nil {
+		t.Fatalf("Deploy to %s: %v", digestB, err)
+	}
+	<-firstOpen
+
+	// Clicked while main still pins digestA: the click-time proposal would
+	// say A -> C, and the click-time rollback target would be A.
+	second, err := h.engine.Deploy(t.Context(), "web", digestC, "admin")
+	if err != nil {
+		t.Fatalf("Deploy to %s: %v", digestC, err)
+	}
+	close(gate)
+	h.engine.Wait()
+
+	if e := h.entry(t, first); e.State != journal.StateHealthy {
+		t.Fatalf("first deploy = %q (%s), want healthy", e.State, e.Detail)
+	}
+	e := h.entry(t, second)
+	if e.State != journal.StateRolledBack {
+		t.Fatalf("second deploy = %q (%s), want rolled-back", e.State, e.Detail)
+	}
+
+	opened, _, _ := h.pr.snapshot()
+	if len(opened) != 3 {
+		t.Fatalf("opened %d PRs, want deploy, queued deploy, revert", len(opened))
+	}
+	if strings.Contains(opened[1].Content, digestA) {
+		t.Errorf("queued proposal reverts the interleaved deploy: %q", opened[1].Content)
+	}
+	if !strings.Contains(opened[1].Content, digestC) {
+		t.Errorf("queued proposal lost its own digest: %q", opened[1].Content)
+	}
+	if !strings.Contains(opened[2].Content, digestB) {
+		t.Errorf("revert restores the click-time digest, not the interleaved one: %q",
+			opened[2].Content)
+	}
+
+	applied := h.applier.calls()
+	if len(applied) != 3 || applied[2] != digestB {
+		t.Fatalf("applied = %v, want the rollback to restore %s", applied, digestB)
+	}
+}
+
+// When the queued-for manifest has changed shape underneath the wait — the
+// current digest no longer occurs exactly once — the deploy must refuse
+// rather than guess, and say how to recover.
+func TestQueuedDeployFailsWhenTheManifestChangedShape(t *testing.T) {
+	h := newHarness(t, digestA)
+
+	gate := make(chan struct{})
+	var reached sync.Once
+	firstOpen := make(chan struct{})
+	h.pr.mu.Lock()
+	h.pr.onOpen = func(service string, content []byte) {
+		reached.Do(func() { close(firstOpen) })
+		<-gate
+		// The landing carries the digest twice, so setDigest can no longer
+		// find the one occurrence to rewrite.
+		h.repo.merge(service, append(content, []byte("# was "+digestB+"\n")...))
+	}
+	h.pr.mu.Unlock()
+
+	if _, err := h.engine.Deploy(t.Context(), "web", digestB, "admin"); err != nil {
+		t.Fatalf("Deploy: %v", err)
+	}
+	<-firstOpen
+	second, err := h.engine.Deploy(t.Context(), "web", digestC, "admin")
+	if err != nil {
+		t.Fatalf("second Deploy: %v", err)
+	}
+	close(gate)
+	h.engine.Wait()
+
+	e := h.entry(t, second)
+	if e.State != journal.StateFailed {
+		t.Fatalf("state = %q (%s), want failed", e.State, e.Detail)
+	}
+	if !strings.Contains(e.Detail, "changed while this deploy was queued") {
+		t.Errorf("detail does not explain the refusal: %q", e.Detail)
+	}
+	opened, _, _ := h.pr.snapshot()
+	if len(opened) != 1 {
+		t.Fatalf("the refused deploy still opened a proposal: %d PRs", len(opened))
 	}
 }
 
@@ -865,34 +1027,96 @@ func TestDuplicateClickJoinsThePendingDeploy(t *testing.T) {
 	}
 }
 
-// A deploy that reaches the front of the queue after an earlier one already
-// landed its digest must finish as a no-op, not propose an empty change.
-func TestQueuedDeployWhoseDigestAlreadyLandedIsANoOp(t *testing.T) {
-	h := newHarness(t, digestA)
+// landedWhileQueued arranges for a deploy of web to digestB to reach the front
+// of the merge queue after main already pins digestB: a deploy of api holds
+// the merge span while web is clicked, and the landing happens underneath the
+// wait. It returns web's journal id after both runs finished.
+func landedWhileQueued(t *testing.T, h *harness) int64 {
+	t.Helper()
+	h.repo.mu.Lock()
+	h.repo.raw["api"] = strings.Replace(manifestYAML(digestA), "name: web", "name: api", 1)
+	h.repo.mu.Unlock()
+	h.insp.mu.Lock()
+	h.insp.running["api"] = digestA
+	h.insp.mu.Unlock()
 
-	// Simulate the earlier deploy having landed: the merged manifest already
-	// pins the target before this run reaches the merge queue.
-	h.repo.merge("web", []byte(manifestYAML(digestB)))
+	gate := make(chan struct{})
+	var reached sync.Once
+	firstOpen := make(chan struct{})
+	h.pr.mu.Lock()
+	h.pr.onOpen = func(service string, content []byte) {
+		reached.Do(func() { close(firstOpen) })
+		<-gate
+		h.repo.merge(service, content)
+	}
+	h.pr.mu.Unlock()
+
+	if _, err := h.engine.Deploy(t.Context(), "api", digestB, "admin"); err != nil {
+		t.Fatalf("Deploy api: %v", err)
+	}
+	<-firstOpen
 
 	id, err := h.engine.Deploy(t.Context(), "web", digestB, "admin")
-	if err == nil {
-		h.waitTerminal(t)
-		e := h.entry(t, id)
-		if e.State != journal.StateHealthy {
-			t.Fatalf("state = %q (%s), want healthy no-op", e.State, e.Detail)
-		}
-		if !strings.Contains(e.Detail, "already") {
-			t.Errorf("detail does not say it was a no-op: %q", e.Detail)
-		}
-		opened, _, _ := h.pr.snapshot()
-		if len(opened) != 0 {
-			t.Errorf("a no-op deploy opened a proposal: %d", len(opened))
-		}
-		return
+	if err != nil {
+		t.Fatalf("Deploy web: %v", err)
 	}
-	// Equally correct: start() itself refuses because the manifest already
-	// pins the digest.
-	if !errors.Is(err, ErrAlreadyAtDigest) {
-		t.Fatalf("Deploy: %v", err)
+	h.repo.merge("web", []byte(manifestYAML(digestB)))
+	close(gate)
+	h.engine.Wait()
+	return id
+}
+
+// A deploy that reaches the front of the queue after an earlier one already
+// landed its digest — and the host runs it — must finish as a no-op, not
+// propose an empty change.
+func TestQueuedDeployWhoseDigestLandedAndRunsIsANoOp(t *testing.T) {
+	h := newHarness(t, digestA)
+	h.insp.mu.Lock()
+	h.insp.running["web"] = digestB
+	h.insp.mu.Unlock()
+
+	id := landedWhileQueued(t, h)
+
+	e := h.entry(t, id)
+	if e.State != journal.StateHealthy {
+		t.Fatalf("state = %q (%s), want healthy no-op", e.State, e.Detail)
+	}
+	if !strings.Contains(e.Detail, "already") {
+		t.Errorf("detail does not say it was a no-op: %q", e.Detail)
+	}
+	if applied := h.applier.callsFor("web"); len(applied) != 0 {
+		t.Errorf("a no-op deploy touched the host: %v", applied)
+	}
+	opened, _, _ := h.pr.snapshot()
+	for _, pr := range opened {
+		if pr.Service == "web" {
+			t.Errorf("a no-op deploy opened a proposal: %+v", pr)
+		}
+	}
+}
+
+// Manifest equality alone must not produce a healthy receipt: during a revert
+// window main still pins the digest that just failed its probe, and a receipt
+// here would poison LastHealthyDigest with it. When the host does not run the
+// pinned digest, the deploy applies the merged manifest and earns its receipt
+// from the probe.
+func TestQueuedDeployWhoseDigestLandedButIsNotRunningApplies(t *testing.T) {
+	h := newHarness(t, digestA)
+
+	id := landedWhileQueued(t, h)
+
+	e := h.entry(t, id)
+	if e.State != journal.StateHealthy {
+		t.Fatalf("state = %q (%s), want healthy after applying", e.State, e.Detail)
+	}
+	if applied := h.applier.callsFor("web"); len(applied) != 1 || applied[0] != digestB {
+		t.Fatalf("applied for web = %v, want [%s]: manifest equality must not "+
+			"produce a receipt without the host being brought along", applied, digestB)
+	}
+	opened, _, _ := h.pr.snapshot()
+	for _, pr := range opened {
+		if pr.Service == "web" {
+			t.Errorf("an already-landed deploy opened an empty proposal: %+v", pr)
+		}
 	}
 }

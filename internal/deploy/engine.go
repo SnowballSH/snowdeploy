@@ -57,6 +57,7 @@ type Inspector interface {
 // every later event, so a client that joined mid-deploy still gets the links.
 type Event struct {
 	Service   string    `json:"service"`
+	Action    string    `json:"action,omitempty"`
 	State     string    `json:"state"`
 	Detail    string    `json:"detail"`
 	JournalID int64     `json:"journalId"`
@@ -77,6 +78,10 @@ type Options struct {
 	CheckPoll      time.Duration
 	RevertAttempts int
 	RevertBackoff  time.Duration
+	// MergeBackoff is the pause between a refused merge and the next
+	// attempt, giving GitHub's asynchronous mergeability computation time
+	// to settle.
+	MergeBackoff time.Duration
 
 	// RepoWebURL is the configuration repository's web address, for example
 	// "https://github.com/acme/config". Events derive their pull-request and
@@ -119,6 +124,9 @@ func New(ctx context.Context, opts Options) *Engine {
 	}
 	if opts.RevertBackoff <= 0 {
 		opts.RevertBackoff = 30 * time.Second
+	}
+	if opts.MergeBackoff <= 0 {
+		opts.MergeBackoff = 5 * time.Second
 	}
 	return &Engine{
 		opts:    opts,
@@ -262,6 +270,11 @@ type runRequest struct {
 	prNumber int
 	prURL    string
 	mergeURL string
+
+	// detailPrefix rides in front of every emitted detail. The revert flow
+	// reuses mergeThroughChecks, whose sentences describe advancing a deploy;
+	// the prefix keeps them honest when the same steps are undoing one.
+	detailPrefix string
 }
 
 func (e *Engine) run(req runRequest) {
@@ -281,17 +294,59 @@ func (e *Engine) run(req runRequest) {
 
 	e.mergeMu.Lock()
 
-	// By the time this run reaches the front of the queue, an earlier deploy
-	// may have already landed the same digest. Proposing the change again
-	// would be an empty pull request that fails on its own emptiness.
-	if m, _, err := e.opts.Repo.Manifest(req.service); err == nil &&
-		m.Image.Digest == req.newDigest {
+	// The manifest this run froze at click time is stale by the time it
+	// reaches the front of the queue: other deploys landed while it waited.
+	// Everything from here on must be computed against the file as it is now,
+	// or the proposal silently reverts whatever landed in between — and a
+	// rollback would restore the click-time digest, undoing an interleaved
+	// healthy deploy.
+	current, raw, err := e.opts.Repo.Manifest(req.service)
+	if err != nil {
 		e.mergeMu.Unlock()
-		e.finish(req, StateHealthy, fmt.Sprintf(
-			"%s was already brought to %s by an earlier deploy; nothing to do",
-			req.service, req.newDigest))
+		e.fail(req, fmt.Sprintf(
+			"could not re-read the manifest at the front of the queue: %v", err))
 		return
 	}
+
+	if current.Image.Digest == req.newDigest {
+		// An earlier deploy may have already landed the same digest, and
+		// proposing the change again would be an empty pull request that
+		// fails on its own emptiness. But manifest equality alone is not
+		// health: during a revert window main still pins the digest that just
+		// failed its probe, and finishing healthy here would poison
+		// LastHealthyDigest with it. Only what is actually running settles it.
+		running, runErr := e.opts.Inspector.RunningImage(ctx, req.service)
+		e.mergeMu.Unlock()
+		if runErr == nil && running == req.newDigest {
+			e.finish(req, StateHealthy, fmt.Sprintf(
+				"%s was already brought to %s by an earlier deploy; nothing to do",
+				req.service, req.newDigest))
+			return
+		}
+		e.emit(req, StateReconciling, fmt.Sprintf(
+			"main already pins %s but the host does not run it; applying the merged manifest",
+			req.newDigest))
+		if applyErr := e.applyMerged(ctx, req); applyErr != nil {
+			e.rollback(ctx, req, applyErr)
+			return
+		}
+		e.finish(req, StateHealthy, fmt.Sprintf(
+			"%s is healthy on %s", req.service, req.newDigest))
+		return
+	}
+
+	fresh, err := setDigest(raw, current.Image.Digest, req.newDigest)
+	if err != nil {
+		e.mergeMu.Unlock()
+		e.fail(req,
+			"the manifest changed while this deploy was queued; "+
+				"re-run to propose it against the current file")
+		return
+	}
+	req.newContent = fresh
+	req.originalRaw = raw
+	req.oldDigest = current.Image.Digest
+
 	prNumber, err := e.opts.PR.OpenManifestPR(ctx, req.service, req.newContent,
 		prTitle(req.action, req.service, req.newDigest),
 		prBody(req.action, req.service, req.oldDigest, req.newDigest))
@@ -378,6 +433,14 @@ func (e *Engine) mergeThroughChecks(
 			return "", fmt.Errorf("merge failed (%w) and the branch could not be updated: %w",
 				err, updateErr)
 		}
+		// GitHub computes mergeability asynchronously after checks conclude
+		// and after a branch updates, and answers "not mergeable" while it
+		// does — merging again immediately just re-asks the stale question.
+		select {
+		case <-ctx.Done():
+			return "", fmt.Errorf("merge failed: %w", lastErr)
+		case <-time.After(e.opts.MergeBackoff):
+		}
 	}
 	return "", fmt.Errorf("merge failed after %d attempts: %w", mergeAttempts, lastErr)
 }
@@ -408,21 +471,32 @@ func (e *Engine) applyMerged(ctx context.Context, req runRequest) error {
 
 // rollback restores the previously running digest on the host, then brings
 // main back in line with it so the record keeps describing what runs.
+//
+// Every event from here on rides on a copy whose pull-request trail is
+// cleared: the proposal those fields point at is the change being undone, and
+// carrying it further would render the revert's own progress as the failed
+// deploy walking backwards through "checks" with a link nobody can act on.
 func (e *Engine) rollback(ctx context.Context, req runRequest, cause error) {
-	if restoreErr := e.restorePrevious(ctx, req); restoreErr != nil {
-		e.finish(req, StateFailed, fmt.Sprintf(
+	undo := req
+	undo.prNumber, undo.prURL, undo.mergeURL = 0, "", ""
+
+	e.emit(undo, StateReconciling, fmt.Sprintf(
+		"probe failed; restoring %s on the host", shortDigest(req.oldDigest)))
+	if restoreErr := e.restorePrevious(ctx, undo); restoreErr != nil {
+		e.finish(undo, StateFailed, fmt.Sprintf(
 			"%v; the automatic rollback also failed: %v", cause, restoreErr))
 		return
 	}
 
 	detail := fmt.Sprintf("%v; rolled back to %s", cause, req.oldDigest)
-	if err := e.revertMain(ctx, req); err != nil {
+	if err := e.revertMain(ctx, &undo); err != nil {
 		detail += fmt.Sprintf("; main still pins %s and needs a manual revert (%v)",
 			req.newDigest, err)
 	} else {
 		detail += "; main reverted"
 	}
-	e.finish(req, StateRolledBack, detail)
+	undo.detailPrefix = ""
+	e.finish(undo, StateRolledBack, detail)
 }
 
 func (e *Engine) restorePrevious(ctx context.Context, req runRequest) error {
@@ -434,14 +508,25 @@ func (e *Engine) restorePrevious(ctx context.Context, req runRequest) error {
 	if err != nil {
 		return err
 	}
-	return e.opts.Applier.Apply(ctx, m, tmpl, nil)
+	return e.opts.Applier.Apply(ctx, m, tmpl, func(phase string) {
+		if phase == reconcile.PhaseProbing {
+			e.emit(req, StateProbing, "probing "+m.Health.URL)
+		}
+	})
 }
 
 // revertMain opens and merges a pull request restoring the previous manifest,
-// retrying a bounded number of times before giving up loudly.
-func (e *Engine) revertMain(ctx context.Context, req runRequest) error {
+// retrying a bounded number of times before giving up loudly. It mutates req's
+// pull-request trail: each attempt clears it, and the attempt that opens a
+// revert proposal fills it in, so events during the revert link the pull
+// request that is actually in flight.
+func (e *Engine) revertMain(ctx context.Context, req *runRequest) error {
+	req.detailPrefix = "reverting main: "
 	var last error
 	for attempt := 1; attempt <= e.opts.RevertAttempts; attempt++ {
+		req.prNumber, req.prURL, req.mergeURL = 0, "", ""
+		e.emit(*req, StateReconciling, fmt.Sprintf(
+			"attempt %d of %d", attempt, e.opts.RevertAttempts))
 		last = e.revertOnce(ctx, req)
 		if last == nil {
 			return nil
@@ -458,7 +543,7 @@ func (e *Engine) revertMain(ctx context.Context, req runRequest) error {
 	return fmt.Errorf("after %d attempts: %w", e.opts.RevertAttempts, last)
 }
 
-func (e *Engine) revertOnce(ctx context.Context, req runRequest) error {
+func (e *Engine) revertOnce(ctx context.Context, req *runRequest) error {
 	e.mergeMu.Lock()
 	defer e.mergeMu.Unlock()
 	prNumber, err := e.opts.PR.OpenManifestPR(ctx, req.service, req.originalRaw,
@@ -470,7 +555,11 @@ func (e *Engine) revertOnce(ctx context.Context, req runRequest) error {
 	if err != nil {
 		return err
 	}
-	if _, err := e.mergeThroughChecks(ctx, req, prNumber); err != nil {
+	req.prNumber = prNumber
+	if e.opts.RepoWebURL != "" {
+		req.prURL = e.opts.RepoWebURL + "/pull/" + strconv.Itoa(prNumber)
+	}
+	if _, err := e.mergeThroughChecks(ctx, *req, prNumber); err != nil {
 		return err
 	}
 	return nil
@@ -530,11 +619,13 @@ func (e *Engine) lock(ctx context.Context, service string) (func(), error) {
 }
 
 func (e *Engine) emit(req runRequest, state, detail string) {
+	detail = req.detailPrefix + detail
 	_ = e.opts.Journal.Progress(req.id, state, detail)
 	e.notify(event(req, state, detail))
 }
 
 func (e *Engine) finish(req runRequest, state, detail string) {
+	detail = req.detailPrefix + detail
 	_ = e.opts.Journal.Finish(req.id, state, detail)
 	e.notify(event(req, state, detail))
 }
@@ -542,6 +633,7 @@ func (e *Engine) finish(req runRequest, state, detail string) {
 func event(req runRequest, state, detail string) Event {
 	return Event{
 		Service:   req.service,
+		Action:    req.action,
 		State:     state,
 		Detail:    detail,
 		JournalID: req.id,
