@@ -251,6 +251,17 @@ func (a *appClient) UpdateBranch(ctx context.Context, prNumber int) error {
 		if errors.As(err, &accepted) {
 			return nil
 		}
+		// "There are no new commits on the base branch" is the already-up-to-
+		// date answer, not a failure: the caller retries the merge because
+		// GitHub's mergeability is eventually consistent, and a current
+		// branch is precisely the state it wants. Witnessed live 2026-08-15
+		// on PR #192, where treating this as fatal failed a healthy deploy.
+		var gerr *github.ErrorResponse
+		if errors.As(err, &gerr) && gerr.Response != nil &&
+			gerr.Response.StatusCode == http.StatusUnprocessableEntity &&
+			strings.Contains(strings.ToLower(gerr.Message), "no new commits") {
+			return nil
+		}
 		return fmt.Errorf("update branch of pull request %d: %w", prNumber, err)
 	}
 	return nil

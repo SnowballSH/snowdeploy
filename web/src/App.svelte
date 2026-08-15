@@ -14,6 +14,7 @@
   import {
     applyEvent,
     initialState,
+    isTerminal,
     setError,
     setHistory,
     setRevisions,
@@ -65,6 +66,9 @@
     }
   }
 
+  // act surfaces a failure twice on purpose: in the store for the banner, and
+  // rethrown so the surface the user is actually looking at (the confirm
+  // dialog) can hold it in place.
   async function act(
     run: () => Promise<number>,
     service: string,
@@ -74,7 +78,7 @@
       store = setError(store, null);
     } catch (err) {
       store = setError(store, err instanceof Error ? err.message : String(err));
-      return;
+      throw err;
     }
     await refresh();
     if (route.name === "service") await loadHistory(service);
@@ -95,7 +99,16 @@
     const onClick = (e: MouseEvent) => {
       const anchor = (e.target as HTMLElement | null)?.closest("a");
       const target = anchor?.getAttribute("href");
-      if (!anchor || !target?.startsWith("/") || e.metaKey || e.ctrlKey) return;
+      if (
+        !anchor ||
+        !target?.startsWith("/") ||
+        anchor.target !== "" ||
+        e.metaKey ||
+        e.ctrlKey ||
+        e.shiftKey ||
+        e.button !== 0
+      )
+        return;
       e.preventDefault();
       history.pushState({}, "", target);
       route = parse(location.pathname);
@@ -104,6 +117,15 @@
 
     const unsubscribe = subscribe((ev) => {
       store = applyEvent(store, ev);
+      // A finished deploy changes the catalog: digests, badges, and the
+      // journal's receipt. Waiting for the 30 s poll leaves the page lying
+      // about all three, with a re-armed Deploy button on stale data.
+      if (isTerminal(ev.state)) {
+        void refresh();
+        if (route.name === "service" && route.service === ev.service) {
+          void loadHistory(ev.service);
+        }
+      }
     });
 
     void refresh();
@@ -151,8 +173,11 @@
       name={route.service}
       service={current}
       progress={store.active[route.service]}
-      history={store.history[route.service] ?? []}
+      history={store.history[route.service]}
       revisions={store.revisions}
+      repoWebUrl={store.repoWebUrl}
+      loaded={store.loaded}
+      {onDeploy}
       {onRollback}
     />
   {:else}
@@ -161,6 +186,7 @@
       active={store.active}
       revisions={store.revisions}
       loaded={store.loaded}
+      error={store.error}
       {onDeploy}
     />
   {/if}

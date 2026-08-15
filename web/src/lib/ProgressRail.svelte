@@ -6,6 +6,11 @@
 
   const reached = $derived(lifecycleIndex(progress.state));
 
+  // A state this build does not know (a newer daemon's addition) must not
+  // render as "nothing has started"; the badge below still names it, so the
+  // rail simply withholds judgement.
+  const known = $derived(reached >= 0);
+
   /**
    * Steps that have an artifact link to the outside record: the pull request,
    * its checks tab, and the merge commit. A step is only linked once the
@@ -26,7 +31,7 @@
 </script>
 
 <div class="flex flex-col gap-2">
-  <ol class="flex flex-wrap items-center gap-1.5">
+  <ol class="flex flex-wrap items-center gap-1.5" class:hidden={!known}>
     {#each LIFECYCLE as step, i (step)}
       {@const href = stepHref(step)}
       <li class="flex items-center gap-1.5">

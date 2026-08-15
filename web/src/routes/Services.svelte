@@ -1,7 +1,9 @@
 <script lang="ts">
-  import { Badge, Button, Dialog, Panel, Skeleton } from "foundationui/svelte";
+  import { Button, Panel, Skeleton } from "foundationui/svelte";
   import CommitLine from "../lib/CommitLine.svelte";
+  import DeployConfirm from "../lib/DeployConfirm.svelte";
   import ProgressRail from "../lib/ProgressRail.svelte";
+  import StatusBadge from "../lib/StatusBadge.svelte";
   import { href } from "../lib/router";
   import {
     shortDigest,
@@ -16,13 +18,15 @@
     active,
     revisions,
     loaded,
+    error,
     onDeploy,
   }: {
     services: ServiceStatus[];
     active: Record<string, Progress>;
     revisions: Record<string, Revision>;
     loaded: boolean;
-    onDeploy: (service: string, digest: string) => void;
+    error: string | null;
+    onDeploy: (service: string, digest: string) => Promise<void>;
   } = $props();
 
   let confirmOpen = $state(false);
@@ -34,13 +38,6 @@
     confirmDigest = digest;
     confirmOpen = true;
   }
-
-  function confirmDeploy() {
-    confirmOpen = false;
-    onDeploy(confirmService, confirmDigest);
-  }
-
-  const confirmRevision = $derived(revisions[confirmDigest]);
 </script>
 
 <div class="flex flex-col gap-4">
@@ -69,14 +66,7 @@
           </div>
 
           <div class="flex items-center gap-2">
-            {#if service.drifted}
-              <Badge tone="accent">drifted</Badge>
-            {:else if updateAvailable(service)}
-              <Badge tone="aurora">update available</Badge>
-            {:else}
-              <Badge tone="neutral">in sync</Badge>
-            {/if}
-
+            <StatusBadge {service} progress={active[service.name]} />
             <Button
               variant="primary"
               size="sm"
@@ -120,29 +110,25 @@
       </Panel>
     {:else}
       <Panel tier="glass" padding="lg">
-        <p class="text-ink-secondary">
-          No managed services yet. Add a manifest to the configuration repository.
-        </p>
+        {#if error}
+          <p class="text-ink-secondary">
+            The service catalog could not be read: {error}
+          </p>
+        {:else}
+          <p class="text-ink-secondary">
+            No managed services yet. Add a manifest to the configuration
+            repository.
+          </p>
+        {/if}
       </Panel>
     {/each}
   {/if}
 </div>
 
-<Dialog
+<DeployConfirm
   bind:open={confirmOpen}
-  size="sm"
-  title="Deploy {confirmService}?"
-  description="This opens a pull request, merges it once checks pass, and restarts the service on the new image."
->
-  <p class="font-mono text-sm" title={confirmDigest}>
-    {shortDigest(confirmDigest)}
-  </p>
-  <CommitLine revision={confirmRevision} />
-
-  {#snippet footer()}
-    <Button variant="secondary" size="sm" onclick={() => (confirmOpen = false)}>
-      Cancel
-    </Button>
-    <Button variant="primary" size="sm" onclick={confirmDeploy}>Deploy</Button>
-  {/snippet}
-</Dialog>
+  service={confirmService}
+  digest={confirmDigest}
+  revision={revisions[confirmDigest]}
+  onConfirm={onDeploy}
+/>

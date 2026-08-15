@@ -22,6 +22,7 @@ export type Terminal = (typeof TERMINAL)[number];
 
 export interface DeployEvent {
   service: string;
+  action?: string;
   state: string;
   detail: string;
   journalId: number;
@@ -62,6 +63,9 @@ export interface ServiceStatus {
   drifted: boolean;
   lastDeploy?: HistoryEntry;
   revisions?: Record<string, Revision>;
+  /** The configuration repository's web address, for deriving PR and
+   * commit links on rows that came from the journal rather than an event. */
+  repoWebUrl?: string;
 }
 
 /** An in-flight deploy, as the progress rail renders it. */
@@ -84,6 +88,8 @@ export interface StoreState {
   history: Record<string, HistoryEntry[]>;
   /** digest → commit, merged from every source that has answered. */
   revisions: Record<string, Revision>;
+  /** The configuration repository's web address, once the catalog names it. */
+  repoWebUrl: string;
   /** False until the first services fetch settles, so an empty catalog is
    * only claimed once it is actually known to be empty. */
   loaded: boolean;
@@ -96,9 +102,19 @@ export function initialState(): StoreState {
     active: {},
     history: {},
     revisions: {},
+    repoWebUrl: "",
     loaded: false,
     error: null,
   };
+}
+
+/** prLink derives the pull-request URL for a journal-sourced row. */
+export function prLink(
+  repoWebUrl: string,
+  prNumber: number | undefined,
+): string | undefined {
+  if (!repoWebUrl || !prNumber) return undefined;
+  return `${repoWebUrl}/pull/${prNumber}`;
 }
 
 export function isTerminal(state: string): state is Terminal {
@@ -123,17 +139,27 @@ export function applyEvent(prev: StoreState, ev: DeployEvent): StoreState {
     const started = prev.active[ev.service];
     delete active[ev.service];
 
+    // A receipt for this run may already be in history from an earlier
+    // refetch, frozen at whatever state it was fetched in. The terminal
+    // event must UPDATE that row, not be dropped as a duplicate — a
+    // finished deploy that keeps reading "detected" is a lie.
     const existing = history[ev.service] ?? [];
-    if (!existing.some((entry) => entry.ID === ev.journalId)) {
+    if (existing.some((entry) => entry.ID === ev.journalId)) {
+      history[ev.service] = existing.map((entry) =>
+        entry.ID === ev.journalId
+          ? { ...entry, State: ev.state, Detail: ev.detail, FinishedAt: ev.at }
+          : entry,
+      );
+    } else {
       history[ev.service] = [
         {
           ID: ev.journalId,
           Service: ev.service,
-          Action: "deploy",
+          Action: ev.action || "deploy",
           Actor: "",
           OldDigest: "",
           NewDigest: "",
-          PRNumber: 0,
+          PRNumber: ev.prNumber ?? 0,
           MergeSHA: "",
           State: ev.state,
           Detail: ev.detail,
@@ -162,16 +188,53 @@ export function applyEvent(prev: StoreState, ev: DeployEvent): StoreState {
   return { ...prev, active, history };
 }
 
-/** setServices replaces the catalog, keeping in-flight progress intact. */
+/**
+ * setServices replaces the catalog and reconciles in-flight progress against
+ * it. Events are the fast path but not a reliable one — the stream carries no
+ * replay, so a dropped terminal frame would otherwise strand a rail forever,
+ * and a page loaded mid-deploy would never learn one is running. The
+ * journal's word (lastDeploy) is authoritative in both directions.
+ */
 export function setServices(
   prev: StoreState,
   services: ServiceStatus[],
 ): StoreState {
   const revisions = { ...prev.revisions };
+  const active = { ...prev.active };
+  const known = new Set(services.map((s) => s.name));
+  const repoWebUrl =
+    services.find((s) => s.repoWebUrl)?.repoWebUrl ?? prev.repoWebUrl;
+  for (const name of Object.keys(active)) {
+    if (!known.has(name)) delete active[name];
+  }
   for (const service of services) {
     Object.assign(revisions, service.revisions);
+    const last = service.lastDeploy;
+    const current = active[service.name];
+    if (!last) continue;
+    if (current && isTerminal(last.State) && last.ID >= current.journalId) {
+      delete active[service.name];
+    } else if (!current && !isTerminal(last.State)) {
+      active[service.name] = {
+        journalId: last.ID,
+        service: service.name,
+        state: last.State,
+        detail: last.Detail,
+        at: last.StartedAt,
+        prNumber: last.PRNumber || undefined,
+        prUrl: prLink(repoWebUrl, last.PRNumber),
+      };
+    }
   }
-  return { ...prev, services, revisions, loaded: true, error: null };
+  return {
+    ...prev,
+    services,
+    revisions,
+    active,
+    repoWebUrl,
+    loaded: true,
+    error: null,
+  };
 }
 
 /** setRevisions merges one lookup response into the digest → commit map. */

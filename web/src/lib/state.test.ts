@@ -192,3 +192,91 @@ describe("loading and revisions", () => {
     expect(s.revisions["sha256:bbbbbbbbbbbbbbbbbbbb"]).toEqual(rev);
   });
 });
+
+describe("catalog reconciliation", () => {
+  const running = {
+    ID: 9,
+    Service: "web",
+    Action: "deploy",
+    Actor: "admin",
+    OldDigest: "sha256:aaaaaaaaaaaaaaaaaaaa",
+    NewDigest: "sha256:bbbbbbbbbbbbbbbbbbbb",
+    PRNumber: 42,
+    MergeSHA: "",
+    State: "checks",
+    Detail: "waiting for the configuration repository's checks",
+    StartedAt: "2026-08-15T22:00:00Z",
+    FinishedAt: "",
+  };
+
+  it("seeds active from a non-terminal lastDeploy, so a reload mid-deploy shows the rail", () => {
+    const s = setServices(initialState(), [
+      service({ lastDeploy: running }),
+    ]);
+    expect(s.active.web?.journalId).toBe(9);
+    expect(s.active.web?.state).toBe("checks");
+    expect(s.active.web?.prNumber).toBe(42);
+  });
+
+  it("clears a stranded rail when the journal says the run ended", () => {
+    let s = applyEvent(initialState(), event({ state: "reconciling", journalId: 9 }));
+    s = setServices(s, [
+      service({
+        lastDeploy: { ...running, State: "healthy", FinishedAt: "2026-08-15T22:05:00Z" },
+      }),
+    ]);
+    expect(s.active.web).toBeUndefined();
+  });
+
+  it("does not clear a rail on an OLDER terminal receipt", () => {
+    let s = applyEvent(initialState(), event({ state: "checks", journalId: 12 }));
+    s = setServices(s, [
+      service({
+        lastDeploy: { ...running, ID: 9, State: "healthy" },
+      }),
+    ]);
+    expect(s.active.web?.journalId).toBe(12);
+  });
+
+  it("prunes progress for services no longer in the catalog", () => {
+    let s = applyEvent(initialState(), event({ state: "checks", service: "gone" }));
+    s = setServices(s, [service()]);
+    expect(s.active.gone).toBeUndefined();
+  });
+});
+
+describe("history receipt updates", () => {
+  it("updates a frozen non-terminal row when its terminal event arrives", () => {
+    let s = initialState();
+    s = setHistory(s, "web", [
+      {
+        ID: 7,
+        Service: "web",
+        Action: "rollback",
+        Actor: "admin",
+        OldDigest: "",
+        NewDigest: "sha256:bbbbbbbbbbbbbbbbbbbb",
+        PRNumber: 41,
+        MergeSHA: "",
+        State: "detected",
+        Detail: "queued",
+        StartedAt: "2026-08-15T22:00:00Z",
+        FinishedAt: "",
+      },
+    ]);
+    s = applyEvent(s, event({ state: "healthy", journalId: 7, detail: "done" }));
+    const row = s.history.web?.[0];
+    expect(s.history.web?.length).toBe(1);
+    expect(row?.State).toBe("healthy");
+    expect(row?.Detail).toBe("done");
+    expect(row?.Action).toBe("rollback");
+  });
+
+  it("labels a synthesized receipt with the event's action", () => {
+    const s = applyEvent(
+      initialState(),
+      event({ state: "rolled-back", journalId: 8, action: "rollback" }),
+    );
+    expect(s.history.web?.[0]?.Action).toBe("rollback");
+  });
+});
