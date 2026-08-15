@@ -257,6 +257,25 @@ func TestProbeFailsWhenUnreachable(t *testing.T) {
 	}
 }
 
+func TestContainerNamesTriesTheBareNameFirst(t *testing.T) {
+	got := ContainerNames("portfolio")
+	want := []string{"portfolio", "systemd-portfolio"}
+	if len(got) != len(want) {
+		t.Fatalf("ContainerNames = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("ContainerNames[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+	// A unit that sets ContainerName= uses the bare name, and every unit this
+	// was written against does. Trying only the prefixed form reports every
+	// service as not running, which reads as total drift.
+	if got[0] != "portfolio" {
+		t.Errorf("the bare ContainerName= form must be tried first, got %q", got[0])
+	}
+}
+
 func TestUnitNameDerivesFromService(t *testing.T) {
 	if got := UnitName("web"); got != "web.container" {
 		t.Errorf("UnitName = %q, want web.container", got)

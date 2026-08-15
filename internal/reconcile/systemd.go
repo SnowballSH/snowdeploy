@@ -96,17 +96,30 @@ func (s *userSystemd) ReloadAndRestart(ctx context.Context, service string) erro
 	return run(ctx, "systemctl", "--user", "restart", service+".service")
 }
 
+// ContainerNames are the names a Quadlet unit for this service may have given
+// its container, in the order worth trying. A unit that sets ContainerName=
+// uses the bare name; one that does not gets Quadlet's systemd- prefix. Trying
+// only the prefixed form silently reports every service as not running, which
+// reads as total drift rather than as a lookup that asked the wrong question.
+func ContainerNames(service string) []string {
+	return []string{service, "systemd-" + service}
+}
+
 func (s *userSystemd) RunningImage(ctx context.Context, service string) (string, error) {
-	out, err := output(ctx, "podman", "inspect",
-		"--format", "{{.ImageDigest}}", "systemd-"+service)
-	if err != nil {
-		return "", err
+	var lastErr error
+	for _, name := range ContainerNames(service) {
+		out, err := output(ctx, "podman", "inspect", "--format", "{{.ImageDigest}}", name)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if digest := strings.TrimSpace(out); digest != "" {
+			return digest, nil
+		}
+		lastErr = fmt.Errorf("podman reported no image digest for container %s", name)
 	}
-	digest := strings.TrimSpace(out)
-	if digest == "" {
-		return "", fmt.Errorf("podman reported no image digest for %s", service)
-	}
-	return digest, nil
+	return "", fmt.Errorf("no container found for %s (tried %s): %w",
+		service, strings.Join(ContainerNames(service), ", "), lastErr)
 }
 
 func run(ctx context.Context, name string, args ...string) error {
