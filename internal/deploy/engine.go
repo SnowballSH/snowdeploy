@@ -92,8 +92,9 @@ type Engine struct {
 	// request that started it, so it deliberately does not use the caller's.
 	baseCtx context.Context
 
-	mu    sync.Mutex
-	locks map[string]chan struct{}
+	mu      sync.Mutex
+	locks   map[string]chan struct{}
+	pending map[string]pendingRun
 
 	// mergeMu serializes the open-to-merge span across ALL services. The
 	// configuration repository requires branches to be up to date with main,
@@ -123,6 +124,7 @@ func New(ctx context.Context, opts Options) *Engine {
 		opts:    opts,
 		baseCtx: ctx,
 		locks:   make(map[string]chan struct{}),
+		pending: make(map[string]pendingRun),
 	}
 }
 
@@ -188,6 +190,18 @@ func (e *Engine) start(
 		return 0, err
 	}
 
+	// A second click for a target already queued or running is the same
+	// intent, not a second deploy: answer with the run that is already
+	// carrying it. Without this, a deploy waiting its turn in the merge
+	// queue is silently joined by a duplicate that later proposes an empty
+	// change and fails on it.
+	e.mu.Lock()
+	if pending, ok := e.pending[service]; ok && pending.digest == digest {
+		e.mu.Unlock()
+		return pending.id, nil
+	}
+	e.mu.Unlock()
+
 	id, err := e.opts.Journal.Begin(journal.Entry{
 		Service:   service,
 		Action:    action,
@@ -201,9 +215,20 @@ func (e *Engine) start(
 		return 0, err
 	}
 
+	e.mu.Lock()
+	e.pending[service] = pendingRun{digest: digest, id: id}
+	e.mu.Unlock()
+
 	e.inFlight.Add(1)
 	go func() {
 		defer e.inFlight.Done()
+		defer func() {
+			e.mu.Lock()
+			if pending, ok := e.pending[service]; ok && pending.id == id {
+				delete(e.pending, service)
+			}
+			e.mu.Unlock()
+		}()
 		e.run(runRequest{
 			id:          id,
 			action:      action,
@@ -215,6 +240,12 @@ func (e *Engine) start(
 		})
 	}()
 	return id, nil
+}
+
+// pendingRun is a deploy that has a journal entry but has not yet finished.
+type pendingRun struct {
+	digest string
+	id     int64
 }
 
 type runRequest struct {
@@ -236,6 +267,11 @@ type runRequest struct {
 func (e *Engine) run(req runRequest) {
 	ctx := e.baseCtx
 
+	// The click must become visible before any queue is waited on: a deploy
+	// parked behind another service's merge span used to render nothing at
+	// all, which read as a dead button and invited duplicate clicks.
+	e.emit(req, StateDetected, "queued for the merge queue")
+
 	release, err := e.lock(ctx, req.service)
 	if err != nil {
 		e.fail(req, fmt.Sprintf("queued deploy abandoned: %v", err))
@@ -244,6 +280,18 @@ func (e *Engine) run(req runRequest) {
 	defer release()
 
 	e.mergeMu.Lock()
+
+	// By the time this run reaches the front of the queue, an earlier deploy
+	// may have already landed the same digest. Proposing the change again
+	// would be an empty pull request that fails on its own emptiness.
+	if m, _, err := e.opts.Repo.Manifest(req.service); err == nil &&
+		m.Image.Digest == req.newDigest {
+		e.mergeMu.Unlock()
+		e.finish(req, StateHealthy, fmt.Sprintf(
+			"%s was already brought to %s by an earlier deploy; nothing to do",
+			req.service, req.newDigest))
+		return
+	}
 	prNumber, err := e.opts.PR.OpenManifestPR(ctx, req.service, req.newContent,
 		prTitle(req.action, req.service, req.newDigest),
 		prBody(req.action, req.service, req.oldDigest, req.newDigest))
@@ -327,7 +375,7 @@ func (e *Engine) mergeThroughChecks(
 			return "", fmt.Errorf("merge failed: %w", err)
 		}
 		if updateErr := e.opts.PR.UpdateBranch(ctx, prNumber); updateErr != nil {
-			return "", fmt.Errorf("merge failed (%v) and the branch could not be updated: %w",
+			return "", fmt.Errorf("merge failed (%w) and the branch could not be updated: %w",
 				err, updateErr)
 		}
 	}

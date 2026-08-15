@@ -376,7 +376,7 @@ func TestDeployHappyPathStateSequence(t *testing.T) {
 	h.waitTerminal(t)
 
 	want := []string{
-		StatePROpen, StateChecks, StateMerged,
+		StateDetected, StatePROpen, StateChecks, StateMerged,
 		StateReconciling, StateProbing, StateHealthy,
 	}
 	got := h.states()
@@ -442,6 +442,15 @@ func TestEventsCarryThePullRequestTrail(t *testing.T) {
 	wantPRURL := testRepoWebURL + "/pull/1"
 	wantMergeURL := testRepoWebURL + "/commit/mergesha1"
 	for _, ev := range h.eventList() {
+		if ev.State == StateDetected {
+			// The queue announcement precedes the proposal, so it is the one
+			// event that legitimately has no trail to carry.
+			if ev.PRNumber != 0 || ev.PRURL != "" || ev.MergeURL != "" {
+				t.Errorf("detected event carries a trail it cannot have yet: #%d %q %q",
+					ev.PRNumber, ev.PRURL, ev.MergeURL)
+			}
+			continue
+		}
 		if ev.PRNumber != 1 || ev.PRURL != wantPRURL {
 			t.Errorf("%s event pr trail = #%d %q, want #1 %q",
 				ev.State, ev.PRNumber, ev.PRURL, wantPRURL)
@@ -827,5 +836,63 @@ func TestConcurrentDeploysSerializeTheMergeSpan(t *testing.T) {
 	_, merged, _ := h.pr.snapshot()
 	if len(merged) != 2 {
 		t.Fatalf("merged = %v, want both proposals merged", merged)
+	}
+}
+
+// A second click for a target already queued must join the run that carries
+// it, not journal a duplicate that later proposes an empty change.
+func TestDuplicateClickJoinsThePendingDeploy(t *testing.T) {
+	h := newHarness(t, digestA)
+	h.applier.gate = make(chan struct{})
+
+	first, err := h.engine.Deploy(t.Context(), "web", digestB, "admin")
+	if err != nil {
+		t.Fatalf("Deploy: %v", err)
+	}
+	second, err := h.engine.Deploy(t.Context(), "web", digestB, "admin")
+	if err != nil {
+		t.Fatalf("second Deploy: %v", err)
+	}
+	close(h.applier.gate)
+	h.waitTerminal(t)
+
+	if first != second {
+		t.Fatalf("duplicate click journaled a second run: %d vs %d", first, second)
+	}
+	opened, _, _ := h.pr.snapshot()
+	if len(opened) != 1 {
+		t.Fatalf("duplicate click opened a second proposal: %d", len(opened))
+	}
+}
+
+// A deploy that reaches the front of the queue after an earlier one already
+// landed its digest must finish as a no-op, not propose an empty change.
+func TestQueuedDeployWhoseDigestAlreadyLandedIsANoOp(t *testing.T) {
+	h := newHarness(t, digestA)
+
+	// Simulate the earlier deploy having landed: the merged manifest already
+	// pins the target before this run reaches the merge queue.
+	h.repo.merge("web", []byte(manifestYAML(digestB)))
+
+	id, err := h.engine.Deploy(t.Context(), "web", digestB, "admin")
+	if err == nil {
+		h.waitTerminal(t)
+		e := h.entry(t, id)
+		if e.State != journal.StateHealthy {
+			t.Fatalf("state = %q (%s), want healthy no-op", e.State, e.Detail)
+		}
+		if !strings.Contains(e.Detail, "already") {
+			t.Errorf("detail does not say it was a no-op: %q", e.Detail)
+		}
+		opened, _, _ := h.pr.snapshot()
+		if len(opened) != 0 {
+			t.Errorf("a no-op deploy opened a proposal: %d", len(opened))
+		}
+		return
+	}
+	// Equally correct: start() itself refuses because the manifest already
+	// pins the digest.
+	if !errors.Is(err, ErrAlreadyAtDigest) {
+		t.Fatalf("Deploy: %v", err)
 	}
 }
