@@ -39,7 +39,9 @@ jobs:
           context: .
           file: Containerfile.canary
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/snowdeploy-canary-unhealthy:latest
+          # Literal, and lowercase: container repository names must be, and
+          # github.repository_owner is mixed case here.
+          tags: ghcr.io/snowballsh/snowdeploy-canary-unhealthy:latest
           provenance: false
 
       # The digest is what a drill pins, so print it where the run log keeps it.
