@@ -503,6 +503,46 @@ func TestMetricsRecordOutcomes(t *testing.T) {
 	}
 }
 
+// A registry the daemon can no longer reach produces no deploy offer, and
+// before this counter existed it produced no signal either — the UI simply
+// showed nothing new, forever. The outcome label is what an alert reads.
+func TestMetricsCountRegistryPollOutcomes(t *testing.T) {
+	h := newHarness(t)
+
+	h.api.RecordRegistryPoll("ghcr.io/acme/web", nil)
+	h.api.RecordRegistryPoll("ghcr.io/acme/web", errors.New("dial tcp: i/o timeout"))
+	h.api.RecordRegistryPoll("ghcr.io/acme/api", nil)
+
+	msrv := httptest.NewServer(h.api.MetricsHandler())
+	defer msrv.Close()
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, msrv.URL+"/metrics", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := msrv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("scrape: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body := readAll(t, resp)
+
+	for _, want := range []string{
+		`snowdeploy_registry_polls_total{outcome="ok",repository="ghcr.io/acme/web"} 1`,
+		`snowdeploy_registry_polls_total{outcome="error",repository="ghcr.io/acme/web"} 1`,
+		`snowdeploy_registry_polls_total{outcome="ok",repository="ghcr.io/acme/api"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics missing %q", want)
+		}
+	}
+	// The error itself must never reach the exposition: a resolve failure can
+	// carry a URL, and a metric label is world-readable to every scraper.
+	if strings.Contains(body, "i/o timeout") {
+		t.Error("the resolve error text leaked into a metric label")
+	}
+}
+
 func TestMetricsHandlerServesNoDeployAPI(t *testing.T) {
 	h := newHarness(t)
 	msrv := httptest.NewServer(h.api.MetricsHandler())

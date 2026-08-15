@@ -40,6 +40,15 @@ func (ociResolver) ResolveDigest(ctx context.Context, repository, tag string) (s
 	return desc.Digest.String(), nil
 }
 
+// PollObserver is told the outcome of every resolve, successful or not.
+//
+// Without it a watcher that can no longer reach the registry is
+// indistinguishable from one with nothing new to offer: the previous digest
+// keeps being served, and nothing anywhere records that the question stopped
+// being answered. It is a report, not a dependency — a watcher without one
+// polls exactly the same.
+type PollObserver func(repository string, err error)
+
 // Watcher polls a changing set of repositories and remembers the newest digest
 // each one resolved to. A failed poll leaves the previous answer standing:
 // a registry outage must never look like "the image disappeared".
@@ -48,8 +57,9 @@ type Watcher struct {
 	interval time.Duration
 	tag      string
 
-	mu     sync.RWMutex
-	latest map[string]string
+	mu       sync.RWMutex
+	latest   map[string]string
+	observer PollObserver
 }
 
 // NewWatcher builds a watcher polling every interval.
@@ -63,6 +73,13 @@ func NewWatcher(r Resolver, interval time.Duration) *Watcher {
 		tag:      DefaultTag,
 		latest:   make(map[string]string),
 	}
+}
+
+// SetObserver installs the poll observer. Call it before Run.
+func (w *Watcher) SetObserver(fn PollObserver) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.observer = fn
 }
 
 // Latest reports the digest last seen for a repository.
@@ -103,11 +120,21 @@ func (w *Watcher) poll(ctx context.Context, repositories []string) {
 			return
 		}
 		digest, err := w.resolver.ResolveDigest(ctx, repo, w.tag)
+		w.report(repo, err)
 		if err != nil {
 			continue
 		}
 		w.mu.Lock()
 		w.latest[repo] = digest
 		w.mu.Unlock()
+	}
+}
+
+func (w *Watcher) report(repository string, err error) {
+	w.mu.RLock()
+	observer := w.observer
+	w.mu.RUnlock()
+	if observer != nil {
+		observer(repository, err)
 	}
 }

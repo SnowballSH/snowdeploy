@@ -114,6 +114,13 @@ func (s *Server) SetDrift(drift map[string]string) {
 	s.metrics.setDrift(drift, known)
 }
 
+// RecordRegistryPoll counts one registry resolution. It is the watcher's
+// PollObserver, and the only place a registry the daemon can no longer reach
+// becomes visible to anything but a log line.
+func (s *Server) RecordRegistryPoll(repository string, err error) {
+	s.metrics.recordRegistryPoll(repository, err)
+}
+
 // Handler is the loopback API and, when configured, the embedded UI.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()

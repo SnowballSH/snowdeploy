@@ -150,6 +150,17 @@ func build(ctx context.Context, cfg *config.Config) (*daemon, error) {
 		UI:               api.UI(),
 	})
 
+	// A registry that stops answering offers no deploy, which on its own is
+	// indistinguishable from having nothing new to offer. The counter is what
+	// an alert reads; the log line is what tells the operator why.
+	watcher.SetObserver(func(repository string, err error) {
+		server.RecordRegistryPoll(repository, err)
+		if err != nil {
+			slog.Warn("registry poll failed; no new digest can be offered for this repository",
+				"repository", repository, "error", err)
+		}
+	})
+
 	// The first sync is best-effort: a daemon that cannot reach GitHub must
 	// still start and keep serving reads, per the sealed-store posture.
 	if _, err := repo.Sync(ctx); err != nil {
