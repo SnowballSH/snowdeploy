@@ -10,8 +10,16 @@ export default defineConfig({
   },
   server: {
     proxy: {
-      "/api": "http://127.0.0.1:8092",
-      "/healthz": "http://127.0.0.1:8092",
+      // The dev identity mirrors what the fronting proxy asserts in
+      // production, so the daemon's auth seam stays exercised in dev.
+      "/api": {
+        target: "http://127.0.0.1:8092",
+        headers: { "Remote-User": "dev" },
+      },
+      "/healthz": {
+        target: "http://127.0.0.1:8092",
+        headers: { "Remote-User": "dev" },
+      },
     },
   },
 });

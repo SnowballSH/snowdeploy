@@ -3,7 +3,12 @@
  * session rides the fronting proxy's forward-auth, which is why every call is
  * a same-origin fetch with no Authorization header of its own.
  */
-import type { DeployEvent, HistoryEntry, ServiceStatus } from "./state";
+import type {
+  DeployEvent,
+  HistoryEntry,
+  Revision,
+  ServiceStatus,
+} from "./state";
 
 async function json<T>(response: Response): Promise<T> {
   if (!response.ok) {
@@ -29,6 +34,17 @@ export async function fetchHistory(
 ): Promise<HistoryEntry[]> {
   const path = `/api/v1/services/${encodeURIComponent(service)}/history?n=${n}`;
   return json<HistoryEntry[]>(await fetch(path));
+}
+
+export async function fetchRevisions(
+  service: string,
+  digests: string[],
+): Promise<Record<string, Revision>> {
+  if (digests.length === 0) return {};
+  const path =
+    `/api/v1/services/${encodeURIComponent(service)}/revisions?digests=` +
+    encodeURIComponent(digests.join(","));
+  return json<Record<string, Revision>>(await fetch(path));
 }
 
 async function post(

@@ -1,5 +1,6 @@
 <script lang="ts">
   import { Button, Panel } from "foundationui/svelte";
+  import CommitLine from "../lib/CommitLine.svelte";
   import OutcomeBadge from "../lib/OutcomeBadge.svelte";
   import ProgressRail from "../lib/ProgressRail.svelte";
   import { href } from "../lib/router";
@@ -7,6 +8,7 @@
     shortDigest,
     type HistoryEntry,
     type Progress,
+    type Revision,
     type ServiceStatus,
   } from "../lib/state";
 
@@ -15,12 +17,14 @@
     service,
     progress,
     history,
+    revisions,
     onRollback,
   }: {
     name: string;
     service: ServiceStatus | undefined;
     progress: Progress | undefined;
     history: HistoryEntry[];
+    revisions: Record<string, Revision>;
     onRollback: (service: string, digest: string) => void;
   } = $props();
 
@@ -45,6 +49,7 @@
           service.manifestDigest,
         )}
       </p>
+      <CommitLine revision={revisions[service.runningDigest]} />
     {/if}
 
     {#if progress}
@@ -67,6 +72,7 @@
                 {shortDigest(entry.NewDigest)}
               </span>
             </div>
+            <CommitLine revision={revisions[entry.NewDigest]} />
             <p class="text-xs text-ink-secondary">
               {entry.Action}
               {#if entry.Actor}· {entry.Actor}{/if}

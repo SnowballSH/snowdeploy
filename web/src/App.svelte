@@ -1,6 +1,13 @@
 <script lang="ts">
   import { Callout, PageShell, ThemeToggle } from "foundationui/svelte";
-  import { deploy, fetchHistory, fetchServices, rollback, subscribe } from "./lib/api";
+  import {
+    deploy,
+    fetchHistory,
+    fetchRevisions,
+    fetchServices,
+    rollback,
+    subscribe,
+  } from "./lib/api";
   import { parse, type Route } from "./lib/router";
   import Service from "./routes/Service.svelte";
   import Services from "./routes/Services.svelte";
@@ -9,15 +16,22 @@
     initialState,
     setError,
     setHistory,
+    setRevisions,
     setServices,
   } from "./lib/state";
 
   let store = $state(initialState());
   let route = $state<Route>(parse(location.pathname));
 
+  // Both loaders read `store` only AFTER their await. Reading it before would
+  // be a synchronous read inside whichever $effect called them, making that
+  // effect depend on `store`: every assignment then re-runs the effect, which
+  // closes and reopens the EventSource in a tight loop — the UI flashes and no
+  // deploy event ever survives long enough to arrive.
   async function refresh() {
     try {
-      store = setServices(store, await fetchServices());
+      const services = await fetchServices();
+      store = setServices(store, services);
     } catch (err) {
       store = setError(store, err instanceof Error ? err.message : String(err));
     }
@@ -25,9 +39,29 @@
 
   async function loadHistory(service: string) {
     try {
-      store = setHistory(store, service, await fetchHistory(service));
+      const entries = await fetchHistory(service);
+      store = setHistory(store, service, entries);
+      await loadRevisions(
+        service,
+        entries.map((entry) => entry.NewDigest),
+      );
     } catch (err) {
       store = setError(store, err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  // Best-effort: a digest whose commit the daemon cannot name still renders,
+  // just without the commit line, so a lookup failure is not a page error.
+  async function loadRevisions(service: string, digests: string[]) {
+    const wanted = [
+      ...new Set(digests.filter((d) => d && !store.revisions[d])),
+    ];
+    if (wanted.length === 0) return;
+    try {
+      const found = await fetchRevisions(service, wanted);
+      store = setRevisions(store, found);
+    } catch {
+      // Absence of commit metadata is a degraded label, never an error state.
     }
   }
 
@@ -118,9 +152,16 @@
       service={current}
       progress={store.active[route.service]}
       history={store.history[route.service] ?? []}
+      revisions={store.revisions}
       {onRollback}
     />
   {:else}
-    <Services services={store.services} active={store.active} {onDeploy} />
+    <Services
+      services={store.services}
+      active={store.active}
+      revisions={store.revisions}
+      loaded={store.loaded}
+      {onDeploy}
+    />
   {/if}
 </PageShell>

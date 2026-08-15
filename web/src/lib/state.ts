@@ -26,6 +26,16 @@ export interface DeployEvent {
   detail: string;
   journalId: number;
   at: string;
+  prNumber?: number;
+  prUrl?: string;
+  mergeUrl?: string;
+}
+
+/** The commit an image digest was built from, when the registry knows it. */
+export interface Revision {
+  sha: string;
+  url: string;
+  subject: string;
 }
 
 export interface HistoryEntry {
@@ -51,6 +61,7 @@ export interface ServiceStatus {
   latestAvailable: string;
   drifted: boolean;
   lastDeploy?: HistoryEntry;
+  revisions?: Record<string, Revision>;
 }
 
 /** An in-flight deploy, as the progress rail renders it. */
@@ -60,6 +71,9 @@ export interface Progress {
   state: string;
   detail: string;
   at: string;
+  prNumber?: number;
+  prUrl?: string;
+  mergeUrl?: string;
 }
 
 export interface StoreState {
@@ -68,11 +82,23 @@ export interface StoreState {
   active: Record<string, Progress>;
   /** Newest first, per service. */
   history: Record<string, HistoryEntry[]>;
+  /** digest → commit, merged from every source that has answered. */
+  revisions: Record<string, Revision>;
+  /** False until the first services fetch settles, so an empty catalog is
+   * only claimed once it is actually known to be empty. */
+  loaded: boolean;
   error: string | null;
 }
 
 export function initialState(): StoreState {
-  return { services: [], active: {}, history: {}, error: null };
+  return {
+    services: [],
+    active: {},
+    history: {},
+    revisions: {},
+    loaded: false,
+    error: null,
+  };
 }
 
 export function isTerminal(state: string): state is Terminal {
@@ -118,12 +144,18 @@ export function applyEvent(prev: StoreState, ev: DeployEvent): StoreState {
       ];
     }
   } else {
+    const before = prev.active[ev.service];
     active[ev.service] = {
       journalId: ev.journalId,
       service: ev.service,
       state: ev.state,
       detail: ev.detail,
-      at: prev.active[ev.service]?.at ?? ev.at,
+      at: before?.at ?? ev.at,
+      // Links are carried forward: the daemon sends them from the moment each
+      // is known, but a dropped frame must not un-link the rail.
+      prNumber: ev.prNumber ?? before?.prNumber,
+      prUrl: ev.prUrl ?? before?.prUrl,
+      mergeUrl: ev.mergeUrl ?? before?.mergeUrl,
     };
   }
 
@@ -135,7 +167,19 @@ export function setServices(
   prev: StoreState,
   services: ServiceStatus[],
 ): StoreState {
-  return { ...prev, services, error: null };
+  const revisions = { ...prev.revisions };
+  for (const service of services) {
+    Object.assign(revisions, service.revisions);
+  }
+  return { ...prev, services, revisions, loaded: true, error: null };
+}
+
+/** setRevisions merges one lookup response into the digest → commit map. */
+export function setRevisions(
+  prev: StoreState,
+  found: Record<string, Revision>,
+): StoreState {
+  return { ...prev, revisions: { ...prev.revisions, ...found } };
 }
 
 export function setHistory(
@@ -147,7 +191,9 @@ export function setHistory(
 }
 
 export function setError(prev: StoreState, error: string | null): StoreState {
-  return { ...prev, error };
+  // An error settles the initial load too: the page must stop claiming it is
+  // loading, and show what went wrong instead.
+  return { ...prev, loaded: prev.loaded || error !== null, error };
 }
 
 /** shortDigest is what the tables show; the full value stays in the title. */

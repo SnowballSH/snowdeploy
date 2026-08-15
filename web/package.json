@@ -14,7 +14,7 @@
   "dependencies": {
     "@fontsource-variable/inter": "^5.2.8",
     "@fontsource-variable/jetbrains-mono": "^5.2.8",
-    "foundationui": "https://github.com/SnowballSH/foundationui/releases/download/v0.5.4/foundationui-0.5.4.tgz",
+    "foundationui": "https://github.com/SnowballSH/foundationui/releases/download/v0.5.5/foundationui-0.5.5.tgz",
     "svelte": "^5.43.0"
   },
   "devDependencies": {

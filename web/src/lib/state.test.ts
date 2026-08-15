@@ -4,7 +4,9 @@ import {
   initialState,
   isTerminal,
   lifecycleIndex,
+  setError,
   setHistory,
+  setRevisions,
   setServices,
   shortDigest,
   updateAvailable,
@@ -143,5 +145,50 @@ describe("helpers", () => {
     expect(updateAvailable(service())).toBe(false);
     expect(updateAvailable(service({ latestAvailable: "sha256:newer" }))).toBe(true);
     expect(updateAvailable(service({ latestAvailable: "" }))).toBe(false);
+  });
+});
+
+describe("progress links", () => {
+  it("carries PR and merge links forward when a later event lacks them", () => {
+    let s = initialState();
+    s = applyEvent(
+      s,
+      event({ state: "pr-open", prNumber: 42, prUrl: "https://g/pull/42" }),
+    );
+    s = applyEvent(s, event({ state: "reconciling" }));
+    expect(s.active.web?.prNumber).toBe(42);
+    expect(s.active.web?.prUrl).toBe("https://g/pull/42");
+  });
+
+  it("adopts the merge link when it appears", () => {
+    let s = initialState();
+    s = applyEvent(s, event({ state: "pr-open", prUrl: "https://g/pull/42" }));
+    s = applyEvent(s, event({ state: "merged", mergeUrl: "https://g/commit/abc" }));
+    expect(s.active.web?.mergeUrl).toBe("https://g/commit/abc");
+    expect(s.active.web?.prUrl).toBe("https://g/pull/42");
+  });
+});
+
+describe("loading and revisions", () => {
+  it("is not loaded until the first catalog arrives", () => {
+    const s = initialState();
+    expect(s.loaded).toBe(false);
+    expect(setServices(s, [service()]).loaded).toBe(true);
+  });
+
+  it("settles loading on an error too, so the page can say what went wrong", () => {
+    const s = setError(initialState(), "boom");
+    expect(s.loaded).toBe(true);
+    expect(s.error).toBe("boom");
+  });
+
+  it("merges revisions from the catalog and from lookups", () => {
+    const rev = { sha: "a".repeat(40), url: "https://g/commit/a", subject: "fix" };
+    let s = setServices(initialState(), [
+      service({ revisions: { "sha256:aaaaaaaaaaaaaaaaaaaa": rev } }),
+    ]);
+    s = setRevisions(s, { "sha256:bbbbbbbbbbbbbbbbbbbb": rev });
+    expect(s.revisions["sha256:aaaaaaaaaaaaaaaaaaaa"]).toEqual(rev);
+    expect(s.revisions["sha256:bbbbbbbbbbbbbbbbbbbb"]).toEqual(rev);
   });
 });
