@@ -25,6 +25,42 @@ import (
 // result is never persisted.
 type TokenFunc func(ctx context.Context) (string, error)
 
+// Why the mirror is unusable is reported through this fixed vocabulary rather
+// than through the error Sync returned. A Git transport error quotes the remote
+// URL, and a URL is somewhere a credential can hide; these sentences are
+// written here, so nothing a remote or a filesystem said can ride out on them.
+// The caller of Sync still receives the full error and is expected to log it.
+var (
+	// ErrNeverSynced is the state before the first attempt: the daemon knows
+	// nothing about any service, which is not the same as knowing there are
+	// none.
+	ErrNeverSynced = errors.New(
+		"the daemon has not read the configuration repository yet, " +
+			"so it does not know which services exist")
+
+	// ErrCredentialUnreadable is the reboot case on a host whose secret store
+	// seals itself: the App key cannot be read, so no fetch is possible. It
+	// wraps the cause, so a caller can match either the operator-facing
+	// statement or the credential failure underneath it.
+	ErrCredentialUnreadable = fmt.Errorf(
+		"%w: the daemon has no copy of the merged manifests and cannot tell "+
+			"which services exist; the secret store is probably sealed",
+		ErrCredentialUnavailable)
+
+	// ErrRemoteUnreachable is every other way a fetch fails.
+	ErrRemoteUnreachable = errors.New(
+		"the configuration repository could not be fetched, " +
+			"so the daemon has no current copy of the merged manifests")
+)
+
+// classifySyncFailure reduces a Sync error to the vocabulary above.
+func classifySyncFailure(err error) error {
+	if errors.Is(err, ErrCredentialUnavailable) {
+		return ErrCredentialUnreadable
+	}
+	return ErrRemoteUnreachable
+}
+
 // RepoConfig describes the configuration repository holding the manifests.
 type RepoConfig struct {
 	URL         string
@@ -40,8 +76,9 @@ type RepoConfig struct {
 type Repo struct {
 	cfg RepoConfig
 
-	mu     sync.RWMutex
-	synced bool
+	mu      sync.RWMutex
+	synced  bool
+	failure error
 }
 
 // NewRepo builds a mirror without touching the network.
@@ -62,10 +99,35 @@ func (r *Repo) ManifestPath(service string) string {
 
 // Sync brings the mirror to the remote branch head and returns that commit.
 // The working tree is reset hard, so local drift can never be read as state.
+// Either outcome is recorded, so a reader that finds no services can be told
+// whether the repository says so or the daemon never managed to ask.
 func (r *Repo) Sync(ctx context.Context) (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	head, err := r.fetchAndReset(ctx)
+	if err != nil {
+		r.failure = classifySyncFailure(err)
+		return "", err
+	}
+	r.synced = true
+	r.failure = nil
+	return head, nil
+}
+
+// SyncState reports whether the mirror has ever been populated, and why the
+// last attempt failed. The reason is this package's own words and is safe to
+// hand a client; the error Sync returns is not.
+func (r *Repo) SyncState() (synced bool, reason error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if !r.synced && r.failure == nil {
+		return false, ErrNeverSynced
+	}
+	return r.synced, r.failure
+}
+
+func (r *Repo) fetchAndReset(ctx context.Context) (string, error) {
 	repo, err := r.openOrClone(ctx)
 	if err != nil {
 		return "", err
@@ -106,8 +168,6 @@ func (r *Repo) Sync(ctx context.Context) (string, error) {
 	if err := wt.Clean(&git.CleanOptions{Dir: true}); err != nil {
 		return "", fmt.Errorf("clean worktree: %w", err)
 	}
-
-	r.synced = true
 	return remoteRef.Hash().String(), nil
 }
 
@@ -207,11 +267,12 @@ func (r *Repo) readRelative(dir, file, nameForCheck string) ([]byte, error) {
 	return raw, nil
 }
 
+// requireSynced refuses a read of a mirror that was never populated, and says
+// why in the same words the API reports, so a manifest that is missing because
+// nothing was ever fetched never reads as a manifest that does not exist.
 func (r *Repo) requireSynced() error {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	if !r.synced {
-		return errors.New("repository has not been synced yet")
+	if synced, reason := r.SyncState(); !synced {
+		return reason
 	}
 	return nil
 }

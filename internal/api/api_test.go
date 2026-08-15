@@ -81,6 +81,7 @@ type fakeRepo struct{}
 
 func (fakeRepo) Sync(context.Context) (string, error) { return "head", nil }
 func (fakeRepo) Services() ([]string, error)          { return []string{"web"}, nil }
+func (fakeRepo) SyncState() (bool, error)             { return true, nil }
 func (fakeRepo) Manifest(service string) (*manifest.Manifest, []byte, error) {
 	if service != "web" {
 		return nil, nil, errors.New("no such service")
@@ -89,6 +90,32 @@ func (fakeRepo) Manifest(service string) (*manifest.Manifest, []byte, error) {
 		Name:  "web",
 		Image: manifest.Image{Repository: "registry.example.com/acme/web", Digest: digestManifest},
 	}, nil, nil
+}
+
+// errStoreSealed stands in for the vocabulary gitops reports when the deploy
+// credential cannot be read. The API only forwards it; it does not interpret it.
+var errStoreSealed = errors.New(
+	"the configuration repository credential is unavailable, so the daemon has " +
+		"no merged manifests to read: the secret store is probably sealed")
+
+// syntheticToken is not a credential. It stands where a real one could hide —
+// an operator who ever wrote a token into the remote URL would have git quote
+// it back inside a transport error.
+const syntheticToken = "ghs_synthetic_never_a_real_token"
+
+// unsyncedRepo is the daemon after a reboot with the secret store still sealed:
+// the mirror was never populated, so it knows nothing about any service. It
+// must never be mistaken for a repository that knows the service is absent.
+type unsyncedRepo struct{}
+
+func (unsyncedRepo) Sync(context.Context) (string, error) {
+	return "", fmt.Errorf("clone https://x-access-token:%s@github.com/acme/config.git: %w",
+		syntheticToken, errStoreSealed)
+}
+func (unsyncedRepo) Services() ([]string, error) { return nil, errStoreSealed }
+func (unsyncedRepo) SyncState() (bool, error)    { return false, errStoreSealed }
+func (unsyncedRepo) Manifest(string) (*manifest.Manifest, []byte, error) {
+	return nil, nil, errStoreSealed
 }
 
 type fakeInspector struct{}
@@ -119,6 +146,11 @@ type harness struct {
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
+	return newHarnessWithRepo(t, fakeRepo{})
+}
+
+func newHarnessWithRepo(t *testing.T, repo Repo) *harness {
+	t.Helper()
 
 	j, err := journal.Open(filepath.Join(t.TempDir(), "j.db"))
 	if err != nil {
@@ -137,7 +169,7 @@ func newHarness(t *testing.T) *harness {
 	eng := &fakeEngine{}
 	api := New(Options{
 		Engine:           eng,
-		Repo:             fakeRepo{},
+		Repo:             repo,
 		Inspector:        fakeInspector{},
 		Watcher:          fakeWatcher{},
 		History:          j,
@@ -379,6 +411,128 @@ func TestUnknownServiceIsNotFound(t *testing.T) {
 	}
 	if calls := h.engine.recorded(); len(calls) != 0 {
 		t.Fatalf("unknown service reached the engine: %v", calls)
+	}
+}
+
+// ---- a configuration repository that was never read ------------------------
+
+func errorField(t *testing.T, resp *http.Response) string {
+	t.Helper()
+	var body map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode error body: %v", err)
+	}
+	return body["error"]
+}
+
+// A daemon that has never read the configuration repository knows nothing
+// about any service, which is not the same claim as knowing a service is
+// absent. Answering 404 "no such service" sends the operator hunting for a
+// deleted manifest when the actual fix is to unseal the secret store.
+func TestDeployAgainstAnUnreadRepositoryIsNotAMissingService(t *testing.T) {
+	h := newHarnessWithRepo(t, unsyncedRepo{})
+
+	resp := h.do(t, http.MethodPost, "/api/v1/services/portfolio/deploy",
+		`{"digest":"`+digestLatest+`"}`, remoteUser("admin"))
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("deploy against an unread repository = %d, want 503", resp.StatusCode)
+	}
+
+	detail := errorField(t, resp)
+	if strings.Contains(detail, "no such service") {
+		t.Errorf("an unread repository claimed the service does not exist: %q", detail)
+	}
+	if !strings.Contains(detail, "sealed") {
+		t.Errorf("error body does not say why the daemon cannot answer: %q", detail)
+	}
+	if calls := h.engine.recorded(); len(calls) != 0 {
+		t.Fatalf("request reached the engine: %v", calls)
+	}
+}
+
+// The two cases must stay tellable apart: one means "come back later", the
+// other means "you asked for something that is not there".
+func TestUnknownServiceStaysDistinctFromAnUnreadRepository(t *testing.T) {
+	known := newHarness(t)
+	resp := known.do(t, http.MethodPost, "/api/v1/services/nope/deploy",
+		`{"digest":"`+digestLatest+`"}`, remoteUser("admin"))
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("unknown service on a read repository = %d, want 404", resp.StatusCode)
+	}
+	if detail := errorField(t, resp); !strings.Contains(detail, "no such service") {
+		t.Errorf("unknown service = %q, want it to say so plainly", detail)
+	}
+
+	unread := newHarnessWithRepo(t, unsyncedRepo{})
+	resp = unread.do(t, http.MethodPost, "/api/v1/services/nope/deploy",
+		`{"digest":"`+digestLatest+`"}`, remoteUser("admin"))
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("same name on an unread repository = %d, want 503", resp.StatusCode)
+	}
+}
+
+// An empty list is a claim: "there are no services". A daemon with no copy of
+// the configuration repository is not entitled to make it.
+func TestServiceListSaysWhyItHasNothingToList(t *testing.T) {
+	h := newHarnessWithRepo(t, unsyncedRepo{})
+
+	resp := h.do(t, http.MethodGet, "/api/v1/services", "", remoteUser("admin"))
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("GET /services on an unread repository = %d, want 503", resp.StatusCode)
+	}
+	if detail := errorField(t, resp); !strings.Contains(detail, "sealed") {
+		t.Errorf("error body does not say why the list is missing: %q", detail)
+	}
+}
+
+// The sync error itself must never reach a client: a git transport error
+// quotes the remote URL, and a URL is somewhere a credential can hide.
+func TestTheSyncErrorTextNeverReachesTheClient(t *testing.T) {
+	h := newHarnessWithRepo(t, unsyncedRepo{})
+
+	for _, path := range []string{"/api/v1/services", "/api/v1/services/web/history"} {
+		resp := h.do(t, http.MethodGet, path, "", remoteUser("admin"))
+		if detail := errorField(t, resp); strings.Contains(detail, syntheticToken) {
+			t.Errorf("GET %s echoed the raw sync error to the client: %q", path, detail)
+		}
+	}
+}
+
+// staleRepo has a populated mirror whose refresh is failing: it still knows
+// every service the last successful sync merged.
+type staleRepo struct{ fakeRepo }
+
+func (staleRepo) Sync(context.Context) (string, error) {
+	return "", fmt.Errorf("fetch main: https://x-access-token:%s@github.com/acme/config.git: %w",
+		syntheticToken, errRemoteUnreachable)
+}
+func (staleRepo) SyncState() (bool, error) { return true, errRemoteUnreachable }
+
+var errRemoteUnreachable = errors.New("the configuration repository could not be fetched")
+
+// A mirror the daemon cannot refresh is a different failure from one it never
+// had: there the daemon really is a gateway to a remote that did not answer,
+// and the services it already knows stay actionable.
+func TestAStaleMirrorReportsTheRemoteAndKeepsItsServices(t *testing.T) {
+	h := newHarnessWithRepo(t, staleRepo{})
+
+	resp := h.do(t, http.MethodGet, "/api/v1/services", "", remoteUser("admin"))
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("GET /services with a stale mirror = %d, want 502", resp.StatusCode)
+	}
+	detail := errorField(t, resp)
+	if strings.Contains(detail, syntheticToken) {
+		t.Errorf("the raw fetch error reached the client: %q", detail)
+	}
+	if !strings.Contains(detail, "could not be fetched") {
+		t.Errorf("error body does not name the failure: %q", detail)
+	}
+
+	resp = h.do(t, http.MethodPost, "/api/v1/services/web/deploy",
+		`{"digest":"`+digestLatest+`"}`, remoteUser("admin"))
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("deploy of a known service during a refresh failure = %d, want 202",
+			resp.StatusCode)
 	}
 }
 

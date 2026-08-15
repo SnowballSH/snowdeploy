@@ -1,6 +1,9 @@
 package gitops
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -220,5 +223,79 @@ func TestManifestBeforeSync(t *testing.T) {
 	r := newTestRepo(t, remote)
 	if _, _, err := r.Manifest("web"); err == nil {
 		t.Fatal("Manifest succeeded before any Sync")
+	}
+}
+
+func TestSyncStateIsCleanAfterASuccessfulSync(t *testing.T) {
+	remote, _ := fixtureRemote(t)
+	r := newTestRepo(t, remote)
+
+	if synced, reason := r.SyncState(); synced || !errors.Is(reason, ErrNeverSynced) {
+		t.Fatalf("SyncState before any attempt = (%v, %v), want (false, ErrNeverSynced)", synced, reason)
+	}
+	if _, err := r.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if synced, reason := r.SyncState(); !synced || reason != nil {
+		t.Fatalf("SyncState after a good Sync = (%v, %v), want (true, nil)", synced, reason)
+	}
+}
+
+// A sealed secret store is the reboot case: the App key cannot be read, so no
+// clone is possible. The daemon must be able to say that in those words, and
+// must not repeat the transport error, which quotes the remote URL.
+func TestSyncStateNamesAnUnreadableCredentialWithoutQuotingTheError(t *testing.T) {
+	const synthetic = "ghs_synthetic_never_a_real_token"
+
+	r := NewRepo(RepoConfig{
+		URL:         "https://github.com/acme/config.git",
+		Branch:      "main",
+		CacheDir:    filepath.Join(t.TempDir(), "cache"),
+		ManifestDir: "deploy/manifests",
+		TemplateDir: "deploy/templates",
+		TokenFn: func(context.Context) (string, error) {
+			return "", fmt.Errorf("%w: cannot read /var/lib/snowdeploy/github-app.pem "+
+				"(secret store sealed?): stale token %s", ErrCredentialUnavailable, synthetic)
+		},
+	})
+
+	if _, err := r.Sync(t.Context()); err == nil {
+		t.Fatal("Sync succeeded with an unreadable credential")
+	}
+
+	synced, reason := r.SyncState()
+	if synced {
+		t.Fatal("SyncState reports a mirror that was never populated as synced")
+	}
+	if !errors.Is(reason, ErrCredentialUnreadable) {
+		t.Fatalf("SyncState reason = %v, want it to name the unreadable credential", reason)
+	}
+	if !strings.Contains(reason.Error(), "sealed") {
+		t.Errorf("SyncState reason = %q, want it to name the sealed store", reason)
+	}
+	if strings.Contains(reason.Error(), synthetic) {
+		t.Errorf("SyncState quoted the underlying error back: %q", reason)
+	}
+}
+
+func TestSyncStateSeparatesAnUnreachableRemoteFromAnUnreadableCredential(t *testing.T) {
+	r := NewRepo(RepoConfig{
+		URL:      "https://127.0.0.1:1/acme/config.git",
+		Branch:   "main",
+		CacheDir: filepath.Join(t.TempDir(), "cache"),
+	})
+
+	if _, err := r.Sync(t.Context()); err == nil {
+		t.Fatal("Sync succeeded against a dead remote")
+	}
+	synced, reason := r.SyncState()
+	if synced {
+		t.Fatal("SyncState reports an empty mirror as synced")
+	}
+	if !errors.Is(reason, ErrRemoteUnreachable) {
+		t.Fatalf("SyncState reason = %v, want ErrRemoteUnreachable", reason)
+	}
+	if errors.Is(reason, ErrCredentialUnreadable) {
+		t.Error("an unreachable remote was reported as a credential problem")
 	}
 }

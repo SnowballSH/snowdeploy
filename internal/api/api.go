@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -36,6 +37,10 @@ type Repo interface {
 	Sync(ctx context.Context) (string, error)
 	Services() ([]string, error)
 	Manifest(service string) (*manifest.Manifest, []byte, error)
+	// SyncState reports whether the mirror has ever been populated and, when
+	// the last attempt failed, a reason the repository authored itself. The
+	// API forwards that reason to clients and never the error from Sync.
+	SyncState() (synced bool, reason error)
 }
 
 // Inspector reports the digest actually running.
@@ -171,7 +176,15 @@ func (s *Server) authed(h actorHandler) http.Handler {
 
 func (s *Server) handleServices(w http.ResponseWriter, r *http.Request, _ string) {
 	if _, err := s.opts.Repo.Sync(r.Context()); err != nil {
-		writeError(w, http.StatusBadGateway, err)
+		// The error itself stops at the daemon's own journal, where the
+		// identical start-up failure is already logged. It must not travel
+		// further: a Git transport error quotes the remote URL, and an
+		// operator who ever wrote a token into that URL would be handing it
+		// to every browser and CLI behind the proxy. What crosses the wire is
+		// the repository's own reason.
+		slog.Warn("configuration sync failed while listing services", "error", err)
+		synced, reason := s.opts.Repo.SyncState()
+		writeUnavailable(w, synced, reason)
 		return
 	}
 	names, err := s.opts.Repo.Services()
@@ -286,10 +299,19 @@ func (s *Server) dispatch(w http.ResponseWriter, _ *http.Request, run func() (in
 
 // service resolves and validates the path's service name against the merged
 // manifests, so an unknown or crafted name never reaches the engine.
+//
+// Readiness is settled before the lookup, and that order is the point: a
+// daemon with no copy of the configuration repository cannot distinguish a
+// service that was deleted from one it has simply never read about, so it must
+// not answer as though it could.
 func (s *Server) service(w http.ResponseWriter, r *http.Request) (string, bool) {
 	name := r.PathValue("name")
 	if name == "" || strings.ContainsAny(name, "/\\") || strings.Contains(name, "..") {
 		writeError(w, http.StatusBadRequest, errors.New("invalid service name"))
+		return "", false
+	}
+	if synced, reason := s.opts.Repo.SyncState(); !synced {
+		writeUnavailable(w, synced, reason)
 		return "", false
 	}
 	if _, _, err := s.opts.Repo.Manifest(name); err != nil {
@@ -308,6 +330,43 @@ func decodeDigest(w http.ResponseWriter, r *http.Request) (digestRequest, bool) 
 		return digestRequest{}, false
 	}
 	return req, true
+}
+
+// errNoConfiguration answers a Repo that reports itself unsynced without
+// saying why. That breaks the interface's contract, but a vague sentence beats
+// dereferencing a nil error inside a handler.
+var errNoConfiguration = errors.New(
+	"the daemon has no usable copy of the configuration repository")
+
+// writeUnavailable answers a request the daemon cannot honour because it has
+// no usable view of the configuration repository. It is the one place that
+// choice of status code lives.
+//
+// A mirror that was never populated is 503. The condition is temporary and
+// operator-clearable — this host's secret store seals on every reboot, so the
+// daemon routinely starts with no credential and therefore no clone — and 503
+// says something about the server rather than about the resource, which is
+// exactly the distinction being drawn: the daemon does not know whether the
+// service exists. 404 asserts that it does not, which is a claim there is no
+// evidence for, and it is the claim that sends an operator looking for a
+// manifest nobody deleted. 500 would say something broke; nothing did, this
+// start-up posture is deliberate. 502 would blame the remote for a key the
+// host could not read locally. No Retry-After rides along: the delay is
+// however long it takes a human to unseal the store, and a number here would
+// be a promise the daemon cannot keep.
+//
+// A mirror that is populated but could not be refreshed is 502, because there
+// the daemon really did act as a gateway to the remote and the remote is the
+// half that did not answer.
+func writeUnavailable(w http.ResponseWriter, synced bool, reason error) {
+	if reason == nil {
+		reason = errNoConfiguration
+	}
+	code := http.StatusServiceUnavailable
+	if synced {
+		code = http.StatusBadGateway
+	}
+	writeError(w, code, reason)
 }
 
 func writeJSON(w http.ResponseWriter, code int, body any) {
