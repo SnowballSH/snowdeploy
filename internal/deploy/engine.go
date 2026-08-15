@@ -95,6 +95,15 @@ type Engine struct {
 	mu    sync.Mutex
 	locks map[string]chan struct{}
 
+	// mergeMu serializes the open-to-merge span across ALL services. The
+	// configuration repository requires branches to be up to date with main,
+	// so two proposals opened from the same base cannot both merge: whichever
+	// lands first strands the other — witnessed 2026-08-15, when three
+	// deploys clicked together produced one merge and two 405s. One proposal
+	// in flight at a time is a merge queue of depth one, which is all four
+	// services need.
+	mergeMu sync.Mutex
+
 	inFlight sync.WaitGroup
 	queued   atomic.Int64
 }
@@ -234,14 +243,17 @@ func (e *Engine) run(req runRequest) {
 	}
 	defer release()
 
+	e.mergeMu.Lock()
 	prNumber, err := e.opts.PR.OpenManifestPR(ctx, req.service, req.newContent,
 		prTitle(req.action, req.service, req.newDigest),
 		prBody(req.action, req.service, req.oldDigest, req.newDigest))
 	if err != nil {
+		e.mergeMu.Unlock()
 		e.fail(req, fmt.Sprintf("could not open the manifest pull request: %v", err))
 		return
 	}
 	if err := e.opts.Journal.SetPR(req.id, prNumber); err != nil {
+		e.mergeMu.Unlock()
 		e.fail(req, fmt.Sprintf("could not record the pull request: %v", err))
 		return
 	}
@@ -251,22 +263,11 @@ func (e *Engine) run(req runRequest) {
 	}
 	e.emit(req, StatePROpen, fmt.Sprintf("pull request #%d opened", prNumber))
 
-	e.emit(req, StateChecks, "waiting for the configuration repository's checks")
-	ok, detail, err := e.opts.PR.WaitChecks(ctx, prNumber, e.opts.CheckPoll)
+	mergeSHA, err := e.mergeThroughChecks(ctx, req, prNumber)
+	e.mergeMu.Unlock()
 	if err != nil {
 		e.closePR(ctx, prNumber, fmt.Sprintf("snowdeploy abandoned this change: %v", err))
-		e.fail(req, fmt.Sprintf("checks could not be read: %v", err))
-		return
-	}
-	if !ok {
-		e.closePR(ctx, prNumber, "snowdeploy closed this change because its checks failed.")
-		e.fail(req, detail)
-		return
-	}
-
-	mergeSHA, err := e.opts.PR.Merge(ctx, prNumber)
-	if err != nil {
-		e.fail(req, fmt.Sprintf("merge failed: %v", err))
+		e.fail(req, err.Error())
 		return
 	}
 	if err := e.opts.Journal.SetMergeSHA(req.id, mergeSHA); err != nil {
@@ -287,6 +288,50 @@ func (e *Engine) run(req runRequest) {
 	}
 
 	e.rollback(ctx, req, applyErr)
+}
+
+// mergeAttempts bounds how often a refused merge is retried after updating
+// the branch. Each retry re-waits the full check run, so two retries already
+// spans several minutes of base-branch churn — more would mean the repository
+// is moving too fast for a deploy to land at all, which a human should see.
+const mergeAttempts = 3
+
+// mergeThroughChecks waits for the proposal's checks and merges it, updating
+// the branch and re-running the checks when the base has moved underneath it.
+// The caller holds mergeMu, so only external pushes can move the base here.
+func (e *Engine) mergeThroughChecks(
+	ctx context.Context, req runRequest, prNumber int,
+) (string, error) {
+	var lastErr error
+	for attempt := 1; attempt <= mergeAttempts; attempt++ {
+		if attempt == 1 {
+			e.emit(req, StateChecks, "waiting for the configuration repository's checks")
+		} else {
+			e.emit(req, StateChecks, fmt.Sprintf(
+				"main moved underneath the proposal; branch updated, re-running checks (attempt %d of %d)",
+				attempt, mergeAttempts))
+		}
+		ok, detail, err := e.opts.PR.WaitChecks(ctx, prNumber, e.opts.CheckPoll)
+		if err != nil {
+			return "", fmt.Errorf("checks could not be read: %w", err)
+		}
+		if !ok {
+			return "", errors.New(detail)
+		}
+		mergeSHA, err := e.opts.PR.Merge(ctx, prNumber)
+		if err == nil {
+			return mergeSHA, nil
+		}
+		lastErr = err
+		if ctx.Err() != nil {
+			return "", fmt.Errorf("merge failed: %w", err)
+		}
+		if updateErr := e.opts.PR.UpdateBranch(ctx, prNumber); updateErr != nil {
+			return "", fmt.Errorf("merge failed (%v) and the branch could not be updated: %w",
+				err, updateErr)
+		}
+	}
+	return "", fmt.Errorf("merge failed after %d attempts: %w", mergeAttempts, lastErr)
 }
 
 // applyMerged pulls the merged branch and walks it onto the host.
@@ -366,6 +411,8 @@ func (e *Engine) revertMain(ctx context.Context, req runRequest) error {
 }
 
 func (e *Engine) revertOnce(ctx context.Context, req runRequest) error {
+	e.mergeMu.Lock()
+	defer e.mergeMu.Unlock()
 	prNumber, err := e.opts.PR.OpenManifestPR(ctx, req.service, req.originalRaw,
 		fmt.Sprintf("revert %s to %s", req.service, shortDigest(req.oldDigest)),
 		fmt.Sprintf(
@@ -375,14 +422,7 @@ func (e *Engine) revertOnce(ctx context.Context, req runRequest) error {
 	if err != nil {
 		return err
 	}
-	ok, detail, err := e.opts.PR.WaitChecks(ctx, prNumber, e.opts.CheckPoll)
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return errors.New("revert checks failed: " + detail)
-	}
-	if _, err := e.opts.PR.Merge(ctx, prNumber); err != nil {
+	if _, err := e.mergeThroughChecks(ctx, req, prNumber); err != nil {
 		return err
 	}
 	return nil

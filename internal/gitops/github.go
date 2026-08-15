@@ -32,6 +32,11 @@ type PRClient interface {
 	OpenManifestPR(ctx context.Context, service string, newContent []byte, title, body string) (int, error)
 	WaitChecks(ctx context.Context, prNumber int, poll time.Duration) (bool, string, error)
 	Merge(ctx context.Context, prNumber int) (string, error)
+	// UpdateBranch brings the pull request's branch up to date with its base.
+	// The base moving between checks and merge is a normal event under strict
+	// branch protection, not an error: the caller updates, re-waits the
+	// checks, and merges again.
+	UpdateBranch(ctx context.Context, prNumber int) error
 	ClosePR(ctx context.Context, prNumber int, comment string) error
 }
 
@@ -199,9 +204,56 @@ func (a *appClient) OpenManifestPR(
 		Body:  github.Ptr(body),
 	})
 	if err != nil {
+		// A deploy retried after a failed merge finds its own earlier pull
+		// request still open on this same content-derived branch. That
+		// proposal is byte-identical to the one being made, so adopt it
+		// rather than failing the deploy over its own leftovers.
+		if isAlreadyExists(err) {
+			if adopted, findErr := a.openPRForBranch(ctx, c, branch); findErr == nil && adopted != 0 {
+				return adopted, nil
+			}
+		}
 		return 0, fmt.Errorf("open pull request: %w", err)
 	}
 	return pr.GetNumber(), nil
+}
+
+func (a *appClient) openPRForBranch(
+	ctx context.Context, c *github.Client, branch string,
+) (int, error) {
+	prs, _, err := c.PullRequests.List(ctx, a.cfg.Owner, a.cfg.Repo,
+		&github.PullRequestListOptions{
+			State: "open",
+			Head:  a.cfg.Owner + ":" + branch,
+			Base:  a.cfg.BaseBranch,
+		})
+	if err != nil {
+		return 0, fmt.Errorf("list open pull requests for %s: %w", branch, err)
+	}
+	if len(prs) == 0 {
+		return 0, nil
+	}
+	return prs[0].GetNumber(), nil
+}
+
+// UpdateBranch merges the base into the pull request's branch. GitHub answers
+// 202 and does the update asynchronously; "already up to date" style refusals
+// are success for the caller's purpose.
+func (a *appClient) UpdateBranch(ctx context.Context, prNumber int) error {
+	c, err := a.client()
+	if err != nil {
+		return err
+	}
+	_, _, err = c.PullRequests.UpdateBranch(ctx, a.cfg.Owner, a.cfg.Repo, prNumber, nil)
+	if err != nil {
+		// go-github surfaces the intentional 202 as AcceptedError.
+		var accepted *github.AcceptedError
+		if errors.As(err, &accepted) {
+			return nil
+		}
+		return fmt.Errorf("update branch of pull request %d: %w", prNumber, err)
+	}
+	return nil
 }
 
 func (a *appClient) blobSHA(

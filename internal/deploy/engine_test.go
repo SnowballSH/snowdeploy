@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -124,8 +125,18 @@ type fakePR struct {
 	checksErr    error
 	mergeErr     error
 
-	// onOpen lets a test see the merged content land on the fake repo.
-	onOpen func(service string, content []byte)
+	// mergeErrTimes bounds how many merges fail before succeeding; 0 with a
+	// non-nil mergeErr means every merge fails. updated counts UpdateBranch
+	// calls; updateErr makes them fail.
+	mergeErrTimes int
+	mergeFailed   int
+	updated       []int
+	updateErr     error
+
+	// onOpen lets a test see the merged content land on the fake repo;
+	// onMerge lets one observe the span between them.
+	onOpen  func(service string, content []byte)
+	onMerge func()
 }
 
 func (p *fakePR) OpenManifestPR(
@@ -154,10 +165,27 @@ func (p *fakePR) Merge(_ context.Context, n int) (string, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.mergeErr != nil {
-		return "", p.mergeErr
+		if p.mergeErrTimes == 0 || p.mergeFailed < p.mergeErrTimes {
+			p.mergeFailed++
+			return "", p.mergeErr
+		}
 	}
 	p.merged = append(p.merged, n)
+	onMerge := p.onMerge
+	if onMerge != nil {
+		onMerge()
+	}
 	return fmt.Sprintf("mergesha%d", n), nil
+}
+
+func (p *fakePR) UpdateBranch(_ context.Context, n int) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.updateErr != nil {
+		return p.updateErr
+	}
+	p.updated = append(p.updated, n)
+	return nil
 }
 
 func (p *fakePR) ClosePR(_ context.Context, n int, comment string) error {
@@ -701,5 +729,103 @@ func TestSetDigestReplacesExactlyOneOccurrence(t *testing.T) {
 	}
 	if _, err := setDigest(raw, digestC, digestB); err == nil {
 		t.Error("setDigest accepted a digest that is not in the file")
+	}
+}
+
+// The base moving underneath a proposal is a normal event under strict branch
+// protection. One update-branch round must recover it end to end.
+func TestRefusedMergeRecoversAfterBranchUpdate(t *testing.T) {
+	h := newHarness(t, digestA)
+	h.pr.mu.Lock()
+	h.pr.mergeErr = errors.New(`405 Required status check "verify" is expected`)
+	h.pr.mergeErrTimes = 1
+	h.pr.mu.Unlock()
+
+	id, err := h.engine.Deploy(t.Context(), "web", digestB, "admin")
+	if err != nil {
+		t.Fatalf("Deploy: %v", err)
+	}
+	h.waitTerminal(t)
+
+	e := h.entry(t, id)
+	if e.State != journal.StateHealthy {
+		t.Fatalf("journal state = %q (%s), want healthy after one retry", e.State, e.Detail)
+	}
+	_, _, closed := h.pr.snapshot()
+	if len(closed) != 0 {
+		t.Errorf("a recovered deploy closed its own pull request: %v", closed)
+	}
+	h.pr.mu.Lock()
+	updated := len(h.pr.updated)
+	h.pr.mu.Unlock()
+	if updated != 1 {
+		t.Errorf("UpdateBranch calls = %d, want 1", updated)
+	}
+}
+
+// A merge that stays refused must end the deploy, close the proposal so it
+// cannot strand as an open PR, and say how many rounds were tried.
+func TestExhaustedMergeRetriesFailAndCloseThePR(t *testing.T) {
+	h := newHarness(t, digestA)
+	h.pr.mu.Lock()
+	h.pr.mergeErr = errors.New("405 base branch was modified")
+	h.pr.mu.Unlock()
+
+	id, err := h.engine.Deploy(t.Context(), "web", digestB, "admin")
+	if err != nil {
+		t.Fatalf("Deploy: %v", err)
+	}
+	h.waitTerminal(t)
+
+	e := h.entry(t, id)
+	if e.State != journal.StateFailed {
+		t.Fatalf("journal state = %q, want failed", e.State)
+	}
+	if !strings.Contains(e.Detail, "after 3 attempts") {
+		t.Errorf("detail does not say the retries were exhausted: %q", e.Detail)
+	}
+	_, _, closed := h.pr.snapshot()
+	if len(closed) != 1 {
+		t.Errorf("the stranded proposal was not closed: closed=%v", closed)
+	}
+}
+
+// Two deploys of different services must not hold open proposals at the same
+// time: an unserialized pair opens both from one base, and strict branch
+// protection strands whichever merges second.
+func TestConcurrentDeploysSerializeTheMergeSpan(t *testing.T) {
+	h := newHarness(t, digestA)
+	h.repo.mu.Lock()
+	h.repo.raw["api"] = strings.Replace(manifestYAML(digestA), "name: web", "name: api", 1)
+	h.repo.mu.Unlock()
+	h.insp.mu.Lock()
+	h.insp.running["api"] = digestA
+	h.insp.mu.Unlock()
+
+	var depth, worst atomic.Int64
+	h.pr.mu.Lock()
+	h.pr.onOpen = func(service string, content []byte) {
+		if d := depth.Add(1); d > worst.Load() {
+			worst.Store(d)
+		}
+		h.repo.merge(service, content)
+	}
+	h.pr.mu.Unlock()
+	h.pr.onMerge = func() { depth.Add(-1) }
+
+	if _, err := h.engine.Deploy(t.Context(), "web", digestB, "admin"); err != nil {
+		t.Fatalf("Deploy web: %v", err)
+	}
+	if _, err := h.engine.Deploy(t.Context(), "api", digestB, "admin"); err != nil {
+		t.Fatalf("Deploy api: %v", err)
+	}
+	h.engine.Wait()
+
+	if worst.Load() != 1 {
+		t.Fatalf("open-to-merge spans interleaved: max concurrent proposals = %d, want 1", worst.Load())
+	}
+	_, merged, _ := h.pr.snapshot()
+	if len(merged) != 2 {
+		t.Fatalf("merged = %v, want both proposals merged", merged)
 	}
 }
