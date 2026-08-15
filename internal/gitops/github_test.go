@@ -18,6 +18,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/google/go-github/v88/github"
 )
 
 const (
@@ -467,5 +469,43 @@ func TestNewGitHubAppRequiresIdentity(t *testing.T) {
 		if _, _, err := NewGitHubApp(cfg); err == nil {
 			t.Errorf("incomplete config accepted: %+v", cfg)
 		}
+	}
+}
+
+// The two 422 shapes that must both read as "already exists": CreateRef says
+// it in the top-level message; the duplicate-pull-request answer says only
+// "Validation Failed" there and buries it in the errors array. The second
+// shape is verbatim from production on 2026-08-15, where the adoption path
+// missed it and a retried deploy failed over its own leftover proposal.
+func TestIsAlreadyExistsRecognisesBothGitHub422Shapes(t *testing.T) {
+	resp422 := &http.Response{StatusCode: http.StatusUnprocessableEntity}
+
+	refShape := &github.ErrorResponse{
+		Response: resp422,
+		Message:  "Reference already exists",
+	}
+	if !isAlreadyExists(refShape) {
+		t.Error("CreateRef shape (top-level message) not recognised")
+	}
+
+	duplicatePRShape := &github.ErrorResponse{
+		Response: resp422,
+		Message:  "Validation Failed",
+		Errors: []github.Error{{
+			Resource: "PullRequest",
+			Message:  "A pull request already exists for SnowballSH:snowdeploy/snowblog-web-6a4c88e6a4b1.",
+		}},
+	}
+	if !isAlreadyExists(duplicatePRShape) {
+		t.Error("duplicate-PR shape (errors array) not recognised; a retried deploy fails over its own leftover proposal")
+	}
+
+	plain := &github.ErrorResponse{
+		Response: resp422,
+		Message:  "Validation Failed",
+		Errors:   []github.Error{{Resource: "PullRequest", Message: "base is invalid"}},
+	}
+	if isAlreadyExists(plain) {
+		t.Error("an unrelated validation failure must not be adopted as an existing proposal")
 	}
 }

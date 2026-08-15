@@ -381,7 +381,23 @@ func isAlreadyExists(err error) bool {
 	if !errors.As(err, &gerr) {
 		return false
 	}
-	return gerr.Response != nil &&
-		gerr.Response.StatusCode == http.StatusUnprocessableEntity &&
-		strings.Contains(strings.ToLower(gerr.Message), "already exists")
+	if gerr.Response == nil ||
+		gerr.Response.StatusCode != http.StatusUnprocessableEntity {
+		return false
+	}
+	// Where "already exists" lives depends on the endpoint. CreateRef says it
+	// in the top-level message; the duplicate-pull-request 422 says only
+	// "Validation Failed" there and buries "A pull request already exists
+	// for owner:branch" inside the errors array — witnessed live 2026-08-15,
+	// when the adoption path missed exactly that shape and a retried deploy
+	// failed over its own leftover proposal.
+	if strings.Contains(strings.ToLower(gerr.Message), "already exists") {
+		return true
+	}
+	for _, entry := range gerr.Errors {
+		if strings.Contains(strings.ToLower(entry.Message), "already exists") {
+			return true
+		}
+	}
+	return false
 }
