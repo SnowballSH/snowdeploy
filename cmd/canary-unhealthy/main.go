@@ -18,6 +18,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sync/atomic"
 	"time"
 )
 
@@ -27,12 +28,15 @@ func main() {
 		port = "8080"
 	}
 
+	// Nothing from the request is logged. This fixture answers every path
+	// identically, so echoing the request line would add no information while
+	// letting a crafted path forge entries in its own output.
+	var refused atomic.Int64
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// %q escapes the request line, so a crafted path cannot forge log
-		// entries by smuggling newlines through this fixture's own output.
-		log.Printf("refusing %q %q with 500 (this image is a deploy-failure fixture)",
-			r.Method, r.URL.Path)
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		log.Printf("refused request %d with 500 (this image is a deploy-failure fixture)",
+			refused.Add(1))
 		http.Error(w, "canary-unhealthy: this service never becomes healthy",
 			http.StatusInternalServerError)
 	})
