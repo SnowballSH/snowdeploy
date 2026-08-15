@@ -29,7 +29,9 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("refusing %s %s with 500 (this image is a deploy-failure fixture)",
+		// %q escapes the request line, so a crafted path cannot forge log
+		// entries by smuggling newlines through this fixture's own output.
+		log.Printf("refusing %q %q with 500 (this image is a deploy-failure fixture)",
 			r.Method, r.URL.Path)
 		http.Error(w, "canary-unhealthy: this service never becomes healthy",
 			http.StatusInternalServerError)
