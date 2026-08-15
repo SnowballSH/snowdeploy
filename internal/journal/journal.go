@@ -218,6 +218,34 @@ func (j *Journal) Recent(service string, n int) ([]Entry, error) {
 	return out, nil
 }
 
+// Unfinished returns every entry that never received a receipt, oldest first.
+// After an ungraceful death these rows are the deploys the dying process was
+// carrying: no goroutine in the new process is driving them, so they stay
+// in-flight forever unless someone closes them out.
+func (j *Journal) Unfinished() ([]Entry, error) {
+	rows, err := j.db.Query(`
+		SELECT` + selectColumns + `
+		FROM deploys WHERE finished_at IS NULL
+		ORDER BY started_at ASC, id ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("read unfinished journal entries: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []Entry
+	for rows.Next() {
+		e, err := scanEntry(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read unfinished journal entries: %w", err)
+	}
+	return out, nil
+}
+
 // LastHealthyDigest is the digest of the newest deploy that reached healthy.
 func (j *Journal) LastHealthyDigest(service string) (string, error) {
 	var digest string

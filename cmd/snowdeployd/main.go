@@ -95,6 +95,10 @@ func build(ctx context.Context, cfg *config.Config) (*daemon, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := failOrphanedDeploys(jrnl); err != nil {
+		_ = jrnl.Close()
+		return nil, err
+	}
 
 	pr, tokenFn, err := gitops.NewGitHubApp(gitops.GitHubAppConfig{
 		AppID:          cfg.GitHubAppID,
@@ -183,6 +187,31 @@ func build(ctx context.Context, cfg *config.Config) (*daemon, error) {
 	return &daemon{
 		jrnl: jrnl, repo: repo, engine: engine, server: server, watcher: watcher,
 	}, nil
+}
+
+// failOrphanedDeploys closes out journal rows a previous process left
+// in flight. No goroutine in this process is driving them, but the UI seeds a
+// service's live state from its newest row — so a row stuck in a non-terminal
+// state would read as a deploy in progress forever and lock the service.
+func failOrphanedDeploys(jrnl *journal.Journal) error {
+	orphans, err := jrnl.Unfinished()
+	if err != nil {
+		return err
+	}
+	for _, e := range orphans {
+		detail := fmt.Sprintf("the daemon restarted while this deploy was in %q", e.State)
+		if e.PRNumber > 0 {
+			detail += fmt.Sprintf("; PR #%d may still be open — check it and re-run", e.PRNumber)
+		} else {
+			detail += "; re-run"
+		}
+		if err := jrnl.Finish(e.ID, journal.StateFailed, detail); err != nil {
+			return fmt.Errorf("fail orphaned deploy %d: %w", e.ID, err)
+		}
+		slog.Warn("closed out a deploy orphaned by an earlier process",
+			"journalId", e.ID, "service", e.Service, "state", e.State, "pr", e.PRNumber)
+	}
+	return nil
 }
 
 func (d *daemon) serve(ctx context.Context, cfg *config.Config) error {

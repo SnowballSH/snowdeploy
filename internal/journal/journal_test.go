@@ -199,6 +199,54 @@ func TestPreviousHealthyDigestWithOnlyTheCurrentOne(t *testing.T) {
 	}
 }
 
+func TestUnfinishedReturnsOnlyOpenRowsOldestFirst(t *testing.T) {
+	j := open(t)
+
+	finished := sample()
+	idDone, _ := j.Begin(finished)
+	if err := j.Finish(idDone, StateHealthy, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	older := sample()
+	older.Service = "api"
+	idOlder, _ := j.Begin(older)
+
+	newer := sample()
+	newer.StartedAt = newer.StartedAt.Add(time.Hour)
+	idNewer, _ := j.Begin(newer)
+
+	got, err := j.Unfinished()
+	if err != nil {
+		t.Fatalf("Unfinished: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("Unfinished returned %d entries, want the 2 open ones: %+v", len(got), got)
+	}
+	if got[0].ID != idOlder || got[1].ID != idNewer {
+		t.Errorf("not oldest-first: %d, %d (want %d, %d)", got[0].ID, got[1].ID, idOlder, idNewer)
+	}
+	for _, e := range got {
+		if e.ID == idDone {
+			t.Errorf("a finished entry was reported as unfinished: %+v", e)
+		}
+		if !e.FinishedAt.IsZero() {
+			t.Errorf("an unfinished entry carries a finish time: %+v", e)
+		}
+	}
+}
+
+func TestUnfinishedOnAnEmptyJournal(t *testing.T) {
+	j := open(t)
+	got, err := j.Unfinished()
+	if err != nil {
+		t.Fatalf("Unfinished: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("empty journal reported unfinished entries: %+v", got)
+	}
+}
+
 func TestFinishedRowIsImmutable(t *testing.T) {
 	j := open(t)
 	id, _ := j.Begin(sample())
