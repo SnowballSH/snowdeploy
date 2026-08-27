@@ -40,27 +40,46 @@ health:
 
 // ---- fakes -----------------------------------------------------------------
 
+// fakeRepo keeps the configuration repository's main and the daemon's fetched
+// mirror apart, the way the real gitops repo does: Manifest reads the mirror,
+// merge lands on main, and only Sync brings the mirror up to date. A fake
+// with a single view would make every staleness bug invisible.
 type fakeRepo struct {
 	mu        sync.Mutex
-	raw       map[string]string
+	main      map[string]string
+	mirror    map[string]string
 	templates map[string]string
 	syncs     int
 	syncErr   error
+
+	// onSync runs after each successful sync, outside the lock, with the
+	// sync's ordinal — a test's hook for moving main between two syncs.
+	onSync func(syncs int)
 }
 
 func newFakeRepo(digest string) *fakeRepo {
 	return &fakeRepo{
-		raw:       map[string]string{"web": manifestYAML(digest)},
+		main:      map[string]string{"web": manifestYAML(digest)},
+		mirror:    map[string]string{"web": manifestYAML(digest)},
 		templates: map[string]string{"web.container.tmpl": "[Container]\nImage={{.Image.Repository}}@{{.Image.Digest}}\n"},
 	}
 }
 
 func (r *fakeRepo) Sync(context.Context) (string, error) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.syncs++
 	if r.syncErr != nil {
-		return "", r.syncErr
+		err := r.syncErr
+		r.mu.Unlock()
+		return "", err
+	}
+	for service, content := range r.main {
+		r.mirror[service] = content
+	}
+	n, onSync := r.syncs, r.onSync
+	r.mu.Unlock()
+	if onSync != nil {
+		onSync(n)
 	}
 	return "headsha", nil
 }
@@ -79,7 +98,7 @@ func (r *fakeRepo) SyncState() (bool, error) {
 func (r *fakeRepo) Manifest(service string) (*manifest.Manifest, []byte, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	raw, ok := r.raw[service]
+	raw, ok := r.mirror[service]
 	if !ok {
 		return nil, nil, fmt.Errorf("no manifest for %s", service)
 	}
@@ -104,17 +123,34 @@ func (r *fakeRepo) Services() ([]string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	var out []string
-	for name := range r.raw {
+	for name := range r.mirror {
 		out = append(out, name)
 	}
 	return out, nil
 }
 
-// merge simulates a PR landing on main.
+// seed plants a service in both main and the mirror, as if it had always
+// been there.
+func (r *fakeRepo) seed(service, content string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.main[service] = content
+	r.mirror[service] = content
+}
+
+// setOnSync installs the after-sync hook.
+func (r *fakeRepo) setOnSync(fn func(syncs int)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.onSync = fn
+}
+
+// merge simulates a PR landing on main. The mirror learns of it only when
+// something syncs.
 func (r *fakeRepo) merge(service string, content []byte) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.raw[service] = string(content)
+	r.main[service] = string(content)
 }
 
 type prCall struct {
@@ -1002,9 +1038,7 @@ func TestExhaustedMergeRetriesFailAndCloseThePR(t *testing.T) {
 // protection strands whichever merges second.
 func TestConcurrentDeploysSerializeTheMergeSpan(t *testing.T) {
 	h := newHarness(t, digestA)
-	h.repo.mu.Lock()
-	h.repo.raw["api"] = strings.Replace(manifestYAML(digestA), "name: web", "name: api", 1)
-	h.repo.mu.Unlock()
+	h.repo.seed("api", strings.Replace(manifestYAML(digestA), "name: web", "name: api", 1))
 	h.insp.mu.Lock()
 	h.insp.running["api"] = digestA
 	h.insp.mu.Unlock()
@@ -1201,9 +1235,7 @@ func TestSyncFailureFailsTheRunWithoutLeakingTheError(t *testing.T) {
 // wait. It returns web's journal id after both runs finished.
 func landedWhileQueued(t *testing.T, h *harness) int64 {
 	t.Helper()
-	h.repo.mu.Lock()
-	h.repo.raw["api"] = strings.Replace(manifestYAML(digestA), "name: web", "name: api", 1)
-	h.repo.mu.Unlock()
+	h.repo.seed("api", strings.Replace(manifestYAML(digestA), "name: web", "name: api", 1))
 	h.insp.mu.Lock()
 	h.insp.running["api"] = digestA
 	h.insp.mu.Unlock()
@@ -1350,38 +1382,105 @@ func TestConvergeAppliesTheMergedManifestWithoutAPullRequest(t *testing.T) {
 	}
 }
 
+// A converge clicked while a deploy's proposal is still open journals the
+// click-time pin, but by its turn the pin has moved. It must apply — and its
+// receipt must record — the pin main holds at the front of the queue.
 func TestConvergeAppliesTheManifestAtTheFrontOfTheQueue(t *testing.T) {
 	h := newHarness(t, digestA)
+
 	gate := make(chan struct{})
-	h.applier.gate = gate
+	var reached sync.Once
+	firstOpen := make(chan struct{})
+	h.pr.mu.Lock()
+	h.pr.onOpen = func(service string, content []byte) {
+		reached.Do(func() { close(firstOpen) })
+		<-gate
+		h.repo.merge(service, content)
+	}
+	h.pr.mu.Unlock()
 
 	if _, _, err := h.engine.Deploy(t.Context(), "web", digestB, "admin"); err != nil {
 		t.Fatalf("Deploy: %v", err)
 	}
-	deadline := time.Now().Add(2 * time.Second)
-	for len(h.applier.calls()) == 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("the deploy never reached Apply")
-		}
-		time.Sleep(time.Millisecond)
-	}
+	<-firstOpen
 
 	id, _, err := h.engine.Converge(t.Context(), "web", "admin")
 	if err != nil {
 		t.Fatalf("Converge: %v", err)
 	}
 	close(gate)
-	h.applier.mu.Lock()
-	h.applier.gate = nil
-	h.applier.mu.Unlock()
 	h.engine.Wait()
 
 	if applied := h.applier.calls(); len(applied) != 2 || applied[1] != digestB {
 		t.Fatalf("applied = %v, want the converge to apply the moved pin %s",
 			applied, digestB)
 	}
-	if e := h.entry(t, id); e.State != journal.StateHealthy {
-		t.Errorf("converge state = %q (%s), want healthy", e.State, e.Detail)
+	e := h.entry(t, id)
+	if e.State != journal.StateHealthy {
+		t.Fatalf("converge state = %q (%s), want healthy", e.State, e.Detail)
+	}
+	if e.OldDigest != digestB || e.NewDigest != digestB {
+		t.Errorf("receipt digests = %s -> %s, want the applied pin %s twice: "+
+			"a stale receipt feeds the healthy-digest queries the wrong pin",
+			e.OldDigest, e.NewDigest, digestB)
+	}
+}
+
+// The click-time sync happens before the queue wait, so main can move between
+// it and the converge's turn. The converge must sync again at the front of
+// the queue, or it applies whatever the mirror last happened to hold.
+func TestConvergeSyncsTheMirrorAtTheFrontOfTheQueue(t *testing.T) {
+	h := newHarness(t, digestA)
+	h.repo.setOnSync(func(syncs int) {
+		if syncs == 1 {
+			h.repo.merge("web", []byte(manifestYAMLWithEnv(digestA)))
+		}
+	})
+
+	if _, _, err := h.engine.Converge(t.Context(), "web", "admin"); err != nil {
+		t.Fatalf("Converge: %v", err)
+	}
+	h.waitTerminal(t)
+
+	envs := h.applier.envs()
+	if len(envs) != 1 || envs[0]["BUDGET_MONTHLY_USD"] != "25" {
+		t.Fatalf("applied env = %v: the converge applied the stale mirror "+
+			"instead of syncing at the front of the queue", envs)
+	}
+}
+
+// A sync failure at the front of the queue must fail the run in the
+// repository's own words: the transport error can quote a credential-bearing
+// remote URL, and the journal detail reaches every client.
+func TestConvergeFrontOfQueueSyncFailureDoesNotLeak(t *testing.T) {
+	h := newHarness(t, digestA)
+	transport := "clone https://x-access-token:ghs_synthetic_never_real@github.com/acme/config.git: auth failed"
+	h.repo.setOnSync(func(syncs int) {
+		if syncs == 1 {
+			h.repo.mu.Lock()
+			h.repo.syncErr = errors.New(transport)
+			h.repo.mu.Unlock()
+		}
+	})
+
+	id, _, err := h.engine.Converge(t.Context(), "web", "admin")
+	if err != nil {
+		t.Fatalf("Converge: %v", err)
+	}
+	h.waitTerminal(t)
+
+	e := h.entry(t, id)
+	if e.State != journal.StateFailed {
+		t.Fatalf("state = %q (%s), want failed", e.State, e.Detail)
+	}
+	if strings.Contains(e.Detail, "ghs_synthetic_never_real") {
+		t.Fatalf("the transport error reached the journal: %q", e.Detail)
+	}
+	if !strings.Contains(e.Detail, "could not be fetched") {
+		t.Errorf("detail lost the repository's own reason: %q", e.Detail)
+	}
+	if applied := h.applier.calls(); len(applied) != 0 {
+		t.Errorf("a converge that could not sync still applied: %v", applied)
 	}
 }
 

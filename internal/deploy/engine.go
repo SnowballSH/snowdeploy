@@ -46,6 +46,7 @@ type Store interface {
 	Progress(id int64, state, detail string) error
 	Finish(id int64, state, detail string) error
 	SetPR(id int64, prNumber int) error
+	SetDigests(id int64, oldDigest, newDigest string) error
 	SetMergeSHA(id int64, sha string) error
 	LastHealthyDigest(service string) (string, error)
 	PreviousHealthyDigest(service, notDigest string) (string, error)
@@ -331,7 +332,7 @@ func (e *Engine) run(req runRequest) {
 
 	queuedDetail := "queued for the merge queue"
 	if req.action == journal.ActionConverge {
-		queuedDetail = "queued behind the service's in-flight run"
+		queuedDetail = "queued for the service's turn"
 	}
 	e.emit(req, StateDetected, queuedDetail)
 	release, err := e.lock(ctx, req.service)
@@ -521,20 +522,35 @@ func (e *Engine) syncFailure(err error) string {
 }
 
 // converge applies the manifest as main holds it at the front of the queue.
-// Interleaved deploys may have moved the pin while this run waited; applying
-// the file as it is now is the contract, so the emitted details name the
-// digest actually applied even when the receipt's Begin-time digests lag it.
+// The click-time sync predates the queue wait, so it syncs again here — the
+// mirror can be stale by minutes, or still pinning a digest a revert since
+// took back. Interleaved deploys may also have moved the pin while this run
+// waited; applying the file as it is now is the contract, and the receipt is
+// rewritten to the pin actually applied before it can finish.
 //
 // There is no rollback from here: the unit the host ran before this converge
 // is recorded nowhere, so a failed probe finishes failed and says so.
 func (e *Engine) converge(ctx context.Context, req runRequest) {
+	if _, err := e.opts.Repo.Sync(ctx); err != nil {
+		e.fail(req, "sync merged state: "+e.syncFailure(err))
+		return
+	}
 	m, _, err := e.opts.Repo.Manifest(req.service)
 	if err != nil {
 		e.fail(req, fmt.Sprintf(
 			"could not re-read the manifest at the front of the queue: %v", err))
 		return
 	}
-	req.newDigest = m.Image.Digest
+	if m.Image.Digest != req.newDigest {
+		if err := e.opts.Journal.SetDigests(
+			req.id, m.Image.Digest, m.Image.Digest); err != nil {
+			e.fail(req, fmt.Sprintf(
+				"the pin moved to %s while queued and the journal could not "+
+					"record it: %v", m.Image.Digest, err))
+			return
+		}
+	}
+	req.oldDigest, req.newDigest = m.Image.Digest, m.Image.Digest
 	e.emit(req, StateReconciling, fmt.Sprintf(
 		"re-rendering the merged manifest, digest unchanged at %s",
 		shortDigest(m.Image.Digest)))

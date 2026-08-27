@@ -46,11 +46,19 @@ manifest.
   (the one-run-per-service queue) — then branches into a converge path that
   never touches the merge queue (`mergeMu`): converge opens no pull request,
   so it has no open-to-merge span to serialize.
-- At the front of the queue the manifest is re-read and applied as it is now.
-  If interleaved deploys moved the pin while the converge waited, converge
-  applies the new pin — host matches main is the whole contract. The journal
-  entry keeps its Begin-time digests (receipts are immutable); the emitted
-  details name the digest actually applied.
+- At the front of the queue the converge **syncs again** and then re-reads the
+  manifest. The prologue sync predates the queue wait, so the mirror can be
+  stale by the time the converge's turn comes — or still pinning a digest a
+  revert since took back. The sync failure wording goes through the same
+  `syncFailure` path as every other sync, so the credential-bearing transport
+  error never reaches the journal.
+- If interleaved deploys moved the pin while the converge waited, converge
+  applies the new pin — host matches main is the whole contract — and rewrites
+  the still-unfinished journal entry's digests to the pin actually applied
+  (`Journal.SetDigests`, which refuses finished receipts). Receipts stay
+  immutable; an in-flight entry is not yet a receipt. Without the rewrite, a
+  healthy converge row carrying the click-time pin would feed
+  `PreviousHealthyDigest` a digest that was never verified by this run.
 - States: detected → reconciling → probing → healthy/failed. The UI's
   progress rail already renders runs that skip pr-open/checks/merged (the
   same-digest deploy path produces the same shape).
@@ -103,7 +111,12 @@ Engine (`internal/deploy/engine_test.go` harness):
 - Converge applies the current manifest with no PR opened, states
   detected→reconciling→probing→healthy, journal receipt action=converge.
 - Converge applies the manifest as it stands at the front of the queue after
-  an interleaved deploy moved it.
+  an interleaved deploy moved it, and its receipt records the applied pin.
+- Converge syncs the mirror at the front of the queue: an edit that lands on
+  main after the prologue sync is still applied (the fake repo keeps main and
+  the fetched mirror apart so staleness is visible at all).
+- A front-of-queue sync failure fails the run in the repository's own words,
+  never the transport error.
 - Converge probe failure finishes failed, applies nothing else, opens no PR,
   and leaves LastHealthyDigest unchanged.
 - A duplicate converge click joins the pending converge run.
