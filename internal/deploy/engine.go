@@ -552,7 +552,7 @@ func (e *Engine) converge(ctx context.Context, req runRequest) {
 	}
 	req.oldDigest, req.newDigest = m.Image.Digest, m.Image.Digest
 	e.emit(req, StateReconciling, fmt.Sprintf(
-		"re-rendering the merged manifest, digest unchanged at %s",
+		"re-rendering the merged manifest, still pinned to %s",
 		shortDigest(m.Image.Digest)))
 	if err := e.applyManifest(ctx, req, m); err != nil {
 		e.fail(req, fmt.Sprintf(
