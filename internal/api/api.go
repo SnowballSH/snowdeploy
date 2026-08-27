@@ -49,6 +49,7 @@ var digestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 type Engine interface {
 	Deploy(ctx context.Context, service, digest, actor string) (int64, bool, error)
 	Rollback(ctx context.Context, service, toDigest, actor string) (int64, bool, error)
+	Converge(ctx context.Context, service, actor string) (int64, bool, error)
 	Drift(ctx context.Context) (map[string]string, error)
 	QueueDepth() int64
 }
@@ -185,6 +186,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /api/v1/services/{name}/revisions", s.authed(s.handleRevisions))
 	mux.Handle("POST /api/v1/services/{name}/deploy", s.authed(s.handleDeploy))
 	mux.Handle("POST /api/v1/services/{name}/rollback", s.authed(s.handleRollback))
+	mux.Handle("POST /api/v1/services/{name}/converge", s.authed(s.handleConverge))
 	mux.Handle("GET /api/v1/events", s.authed(func(w http.ResponseWriter, r *http.Request, _ string) {
 		s.handleEvents(w, r)
 	}))
@@ -421,6 +423,19 @@ func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request, actor st
 	}
 	s.dispatch(w, r, func() (int64, bool, error) {
 		return s.opts.Engine.Rollback(r.Context(), name, req.Digest, actor)
+	})
+}
+
+// handleConverge re-applies the merged manifest as it stands. It reads no
+// body: converge has no digest to accept, and accepting one would reintroduce
+// the same-digest ambiguity the action exists to end.
+func (s *Server) handleConverge(w http.ResponseWriter, r *http.Request, actor string) {
+	name, ok := s.service(w, r)
+	if !ok {
+		return
+	}
+	s.dispatch(w, r, func() (int64, bool, error) {
+		return s.opts.Engine.Converge(r.Context(), name, actor)
 	})
 }
 

@@ -62,6 +62,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return followedCommand(ctx, "deploy", rest, stdout, stderr)
 	case "rollback":
 		return followedCommand(ctx, "rollback", rest, stdout, stderr)
+	case "converge":
+		return followedCommand(ctx, "converge", rest, stdout, stderr)
 	case "history":
 		err = cmdHistory(ctx, rest, stdout)
 	case "help", "-h", "--help":
@@ -86,10 +88,14 @@ func usage(w io.Writer) {
   snowdeploy status
   snowdeploy deploy   <service> [--digest sha256:...]
   snowdeploy rollback <service> [--to sha256:...]
+  snowdeploy converge <service>
   snowdeploy history  <service> [-n 20]
   snowdeploy validate <dir> [--volume-prefixes p1,p2] [--env-file-prefixes p1,p2]
 
-Connection flags (status, deploy, rollback, history):
+converge re-applies the merged manifest without moving the image pin — for an
+env, volume, or template edit that merged on its own.
+
+Connection flags (status, deploy, rollback, converge, history):
   --server      daemon base URL      (env `+envServer+`)
   --token-file  file holding the CLI bearer token (env `+envTokenFile+`)
 `)
@@ -180,11 +186,16 @@ func followedCommand(
 	fs := newFlagSet(action, stderr)
 	server, tokenFile := connectionFlags(fs)
 
-	digestFlag := "digest"
-	if action == "rollback" {
-		digestFlag = "to"
+	// converge has no digest to accept: it re-applies the pin main already
+	// holds, so it registers no digest flag at all.
+	digest := new(string)
+	if action != "converge" {
+		digestFlag := "digest"
+		if action == "rollback" {
+			digestFlag = "to"
+		}
+		digest = fs.String(digestFlag, "", "digest to pin (sha256:...)")
 	}
-	digest := fs.String(digestFlag, "", "digest to pin (sha256:...)")
 	timeout := fs.Duration("timeout", defaultFollowTimeout,
 		"give up waiting for a terminal state after this long")
 

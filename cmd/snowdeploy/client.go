@@ -200,7 +200,10 @@ func (c *client) startDeploy(
 		JournalID int64 `json:"journalId"`
 	}
 	path := fmt.Sprintf("/api/v1/services/%s/%s", url.PathEscape(service), action)
-	body := map[string]string{"digest": digest}
+	var body any
+	if action != "converge" {
+		body = map[string]string{"digest": digest}
+	}
 	if err := c.do(ctx, http.MethodPost, path, body, &out); err != nil {
 		return 0, err
 	}

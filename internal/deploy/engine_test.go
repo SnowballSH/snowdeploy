@@ -217,11 +217,12 @@ func (p *fakePR) snapshot() ([]prCall, []int, []int) {
 }
 
 type fakeApplier struct {
-	mu        sync.Mutex
-	applied   []string
-	appliedBy []string
-	failOn    map[string]error
-	gate      chan struct{}
+	mu         sync.Mutex
+	applied    []string
+	appliedBy  []string
+	appliedEnv []map[string]string
+	failOn     map[string]error
+	gate       chan struct{}
 }
 
 func (a *fakeApplier) Apply(
@@ -230,6 +231,7 @@ func (a *fakeApplier) Apply(
 	a.mu.Lock()
 	a.applied = append(a.applied, m.Image.Digest)
 	a.appliedBy = append(a.appliedBy, m.Name)
+	a.appliedEnv = append(a.appliedEnv, m.Env)
 	gate := a.gate
 	err := a.failOn[m.Image.Digest]
 	a.mu.Unlock()
@@ -250,6 +252,13 @@ func (a *fakeApplier) calls() []string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return append([]string(nil), a.applied...)
+}
+
+// envs is each applied manifest's env map, in order.
+func (a *fakeApplier) envs() []map[string]string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]map[string]string(nil), a.appliedEnv...)
 }
 
 // callsFor is the digests applied for one service, in order.
@@ -1277,5 +1286,201 @@ func TestQueuedDeployWhoseDigestLandedButIsNotRunningApplies(t *testing.T) {
 		if pr.Service == "web" {
 			t.Errorf("an already-landed deploy opened an empty proposal: %+v", pr)
 		}
+	}
+}
+
+// ---- converge --------------------------------------------------------------
+
+// manifestYAMLWithEnv is a manifest whose only difference from
+// manifestYAML(digest) is an env block — the shape change converge exists for.
+func manifestYAMLWithEnv(digest string) string {
+	return manifestYAML(digest) + "env:\n  BUDGET_MONTHLY_USD: \"25\"\n"
+}
+
+func TestConvergeAppliesTheMergedManifestWithoutAPullRequest(t *testing.T) {
+	h := newHarness(t, digestA)
+	h.repo.merge("web", []byte(manifestYAMLWithEnv(digestA)))
+
+	id, joined, err := h.engine.Converge(t.Context(), "web", "admin")
+	if err != nil {
+		t.Fatalf("Converge: %v", err)
+	}
+	if joined {
+		t.Error("the first converge click reported itself as joining a run")
+	}
+	h.waitTerminal(t)
+
+	want := []string{
+		StateDetected, StateDetected, StateReconciling, StateReconciling,
+		StateProbing, StateHealthy,
+	}
+	if got := h.states(); len(got) != len(want) {
+		t.Fatalf("states = %v, want %v", got, want)
+	} else {
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("state %d = %q, want %q (full: %v)", i, got[i], want[i], got)
+			}
+		}
+	}
+
+	opened, _, _ := h.pr.snapshot()
+	if len(opened) != 0 {
+		t.Errorf("converge opened a pull request: %+v", opened)
+	}
+	if applied := h.applier.calls(); len(applied) != 1 || applied[0] != digestA {
+		t.Fatalf("applied = %v, want the pinned digest once", applied)
+	}
+	if envs := h.applier.envs(); len(envs) != 1 || envs[0]["BUDGET_MONTHLY_USD"] != "25" {
+		t.Errorf("the applied manifest lost the merged env change: %v", envs)
+	}
+
+	e := h.entry(t, id)
+	if e.Action != journal.ActionConverge {
+		t.Errorf("action = %q, want converge", e.Action)
+	}
+	if e.State != journal.StateHealthy {
+		t.Errorf("journal state = %q (%s), want healthy", e.State, e.Detail)
+	}
+	if e.OldDigest != digestA || e.NewDigest != digestA {
+		t.Errorf("journal digests = %s -> %s, want the unchanged pin", e.OldDigest, e.NewDigest)
+	}
+	if e.Actor != "admin" {
+		t.Errorf("actor = %q", e.Actor)
+	}
+}
+
+func TestConvergeAppliesTheManifestAtTheFrontOfTheQueue(t *testing.T) {
+	h := newHarness(t, digestA)
+	gate := make(chan struct{})
+	h.applier.gate = gate
+
+	if _, _, err := h.engine.Deploy(t.Context(), "web", digestB, "admin"); err != nil {
+		t.Fatalf("Deploy: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for len(h.applier.calls()) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the deploy never reached Apply")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	id, _, err := h.engine.Converge(t.Context(), "web", "admin")
+	if err != nil {
+		t.Fatalf("Converge: %v", err)
+	}
+	close(gate)
+	h.applier.mu.Lock()
+	h.applier.gate = nil
+	h.applier.mu.Unlock()
+	h.engine.Wait()
+
+	if applied := h.applier.calls(); len(applied) != 2 || applied[1] != digestB {
+		t.Fatalf("applied = %v, want the converge to apply the moved pin %s",
+			applied, digestB)
+	}
+	if e := h.entry(t, id); e.State != journal.StateHealthy {
+		t.Errorf("converge state = %q (%s), want healthy", e.State, e.Detail)
+	}
+}
+
+func TestConvergeProbeFailureFailsWithoutRollback(t *testing.T) {
+	h := newHarness(t, digestA)
+	h.applier.failOn[digestA] = errors.New("probe: connection refused")
+
+	id, _, err := h.engine.Converge(t.Context(), "web", "admin")
+	if err != nil {
+		t.Fatalf("Converge: %v", err)
+	}
+	h.waitTerminal(t)
+
+	e := h.entry(t, id)
+	if e.State != journal.StateFailed {
+		t.Fatalf("state = %q (%s), want failed", e.State, e.Detail)
+	}
+	if !strings.Contains(e.Detail, "no previous unit") {
+		t.Errorf("detail does not warn that nothing can be restored: %q", e.Detail)
+	}
+	if applied := h.applier.calls(); len(applied) != 1 {
+		t.Errorf("a failed converge applied again: %v", applied)
+	}
+	opened, _, _ := h.pr.snapshot()
+	if len(opened) != 0 {
+		t.Errorf("a failed converge opened a pull request: %+v", opened)
+	}
+	if _, err := h.jrnl.LastHealthyDigest("web"); !errors.Is(err, journal.ErrNoHealthyDeploy) {
+		t.Errorf("a failed converge minted a healthy digest: %v", err)
+	}
+}
+
+func TestDuplicateConvergeClickJoinsThePendingConverge(t *testing.T) {
+	h := newHarness(t, digestA)
+	h.applier.gate = make(chan struct{})
+
+	first, firstJoined, err := h.engine.Converge(t.Context(), "web", "admin")
+	if err != nil {
+		t.Fatalf("Converge: %v", err)
+	}
+	second, secondJoined, err := h.engine.Converge(t.Context(), "web", "admin")
+	if err != nil {
+		t.Fatalf("second Converge: %v", err)
+	}
+	close(h.applier.gate)
+	h.engine.Wait()
+
+	if first != second {
+		t.Fatalf("duplicate converge journaled a second run: %d vs %d", first, second)
+	}
+	if firstJoined || !secondJoined {
+		t.Errorf("join flags = %v, %v; want the second click to join the first",
+			firstJoined, secondJoined)
+	}
+	entries, err := h.jrnl.Recent("web", 50)
+	if err != nil {
+		t.Fatalf("Recent: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("duplicate converge journaled %d runs, want 1", len(entries))
+	}
+}
+
+// A deploy whose proposal has merged still holds the pending entry for its
+// digest, which by then equals the pin. A converge clicked in that window is
+// asking for a fresher apply than that run will perform, so it must start its
+// own run rather than join the deploy's.
+func TestConvergeDoesNotJoinAPendingDeployAtTheSameDigest(t *testing.T) {
+	h := newHarness(t, digestA)
+	gate := make(chan struct{})
+	h.applier.gate = gate
+
+	first, _, err := h.engine.Deploy(t.Context(), "web", digestB, "admin")
+	if err != nil {
+		t.Fatalf("Deploy: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for len(h.applier.calls()) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the deploy never reached Apply")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	converge, joined, err := h.engine.Converge(t.Context(), "web", "admin")
+	if err != nil {
+		t.Fatalf("Converge: %v", err)
+	}
+	if joined || converge == first {
+		t.Fatalf("converge joined the pending deploy: id=%d joined=%v", converge, joined)
+	}
+
+	close(gate)
+	h.applier.mu.Lock()
+	h.applier.gate = nil
+	h.applier.mu.Unlock()
+	h.engine.Wait()
+
+	if e := h.entry(t, converge); e.State != journal.StateHealthy {
+		t.Errorf("converge state = %q (%s), want healthy", e.State, e.Detail)
 	}
 }

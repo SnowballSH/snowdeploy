@@ -16,6 +16,7 @@ import (
 const (
 	ActionDeploy       = "deploy"
 	ActionRollback     = "rollback"
+	ActionConverge     = "converge"
 	ActionAutoRollback = "auto-rollback"
 )
 

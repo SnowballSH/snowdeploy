@@ -177,6 +177,17 @@ func (e *Engine) Rollback(
 		})
 }
 
+// Converge applies the manifest as main has it right now — same digest, fresh
+// render — for the change a deploy cannot carry: an env, volume, or template
+// edit that merged without moving the image pin. It opens no pull request; the
+// change it applies already went through the configuration repository's review.
+func (e *Engine) Converge(
+	_ context.Context, service, actor string,
+) (id int64, joined bool, err error) {
+	return e.start(journal.ActionConverge, service, actor,
+		func(current string) (string, error) { return current, nil })
+}
+
 // resolveTarget turns a request into the digest to pin, given what is pinned.
 type resolveTarget func(currentDigest string) (string, error)
 
@@ -200,13 +211,18 @@ func (e *Engine) start(
 	if !digestPattern.MatchString(digest) {
 		return 0, false, fmt.Errorf("%q is not a sha256 digest pin", digest)
 	}
-	if current.Image.Digest == digest {
-		return 0, false, fmt.Errorf("%s: %w (%s)", service, ErrAlreadyAtDigest, digest)
-	}
-
-	newContent, err := setDigest(raw, current.Image.Digest, digest)
-	if err != nil {
-		return 0, false, err
+	// For converge the pinned digest is the point, and there is no content
+	// change to propose: the run re-renders and re-applies what main already
+	// holds.
+	newContent := raw
+	if action != journal.ActionConverge {
+		if current.Image.Digest == digest {
+			return 0, false, fmt.Errorf("%s: %w (%s)", service, ErrAlreadyAtDigest, digest)
+		}
+		newContent, err = setDigest(raw, current.Image.Digest, digest)
+		if err != nil {
+			return 0, false, err
+		}
 	}
 
 	// A second click for a target already queued or running is the same
@@ -218,7 +234,13 @@ func (e *Engine) start(
 	// fast local SQLite write, cheap enough to hold the lock across.
 	e.mu.Lock()
 	pending, live := e.pending[service]
-	if live && pending.digest == digest {
+	// A converge only ever joins a converge: a pending deploy at the same
+	// digest froze its manifest before the edit the converge was clicked for,
+	// so answering with that run could leave the edit unapplied. Deploys and
+	// rollbacks keep joining each other — both mean "pin this digest".
+	sameKind := (pending.action == journal.ActionConverge) ==
+		(action == journal.ActionConverge)
+	if live && sameKind && pending.digest == digest {
 		e.mu.Unlock()
 		return pending.id, true, nil
 	}
@@ -239,7 +261,7 @@ func (e *Engine) start(
 	// dedup point for every click still matching it. This run proceeds to the
 	// queue unregistered and simply offers no join point of its own.
 	if !live {
-		e.pending[service] = pendingRun{digest: digest, id: id}
+		e.pending[service] = pendingRun{action: action, digest: digest, id: id}
 	}
 	e.mu.Unlock()
 
@@ -266,8 +288,9 @@ func (e *Engine) start(
 	return id, false, nil
 }
 
-// pendingRun is a deploy that has a journal entry but has not yet finished.
+// pendingRun is a run that has a journal entry but has not yet finished.
 type pendingRun struct {
+	action string
 	digest string
 	id     int64
 }
@@ -306,10 +329,14 @@ func (e *Engine) run(req runRequest) {
 		return
 	}
 
-	e.emit(req, StateDetected, "queued for the merge queue")
+	queuedDetail := "queued for the merge queue"
+	if req.action == journal.ActionConverge {
+		queuedDetail = "queued behind the service's in-flight run"
+	}
+	e.emit(req, StateDetected, queuedDetail)
 	release, err := e.lock(ctx, req.service)
 	if err != nil {
-		detail := fmt.Sprintf("queued deploy abandoned: %v", err)
+		detail := fmt.Sprintf("queued %s abandoned: %v", req.action, err)
 		if errors.Is(err, context.Canceled) {
 			detail += "; the daemon was restarting; re-run"
 		}
@@ -317,6 +344,13 @@ func (e *Engine) run(req runRequest) {
 		return
 	}
 	defer release()
+
+	// A converge proposes nothing, so it has no business in the merge queue:
+	// it re-reads main at the front of its own service's queue and applies it.
+	if req.action == journal.ActionConverge {
+		e.converge(ctx, req)
+		return
+	}
 
 	e.lockMergeQueue()
 
@@ -486,6 +520,34 @@ func (e *Engine) syncFailure(err error) string {
 	return detail
 }
 
+// converge applies the manifest as main holds it at the front of the queue.
+// Interleaved deploys may have moved the pin while this run waited; applying
+// the file as it is now is the contract, so the emitted details name the
+// digest actually applied even when the receipt's Begin-time digests lag it.
+//
+// There is no rollback from here: the unit the host ran before this converge
+// is recorded nowhere, so a failed probe finishes failed and says so.
+func (e *Engine) converge(ctx context.Context, req runRequest) {
+	m, _, err := e.opts.Repo.Manifest(req.service)
+	if err != nil {
+		e.fail(req, fmt.Sprintf(
+			"could not re-read the manifest at the front of the queue: %v", err))
+		return
+	}
+	req.newDigest = m.Image.Digest
+	e.emit(req, StateReconciling, fmt.Sprintf(
+		"re-rendering the merged manifest, digest unchanged at %s",
+		shortDigest(m.Image.Digest)))
+	if err := e.applyManifest(ctx, req, m); err != nil {
+		e.fail(req, fmt.Sprintf(
+			"%v; a converge has no previous unit to restore — fix the manifest "+
+				"and converge again, or deploy a known-good digest", err))
+		return
+	}
+	e.finish(req, StateHealthy, fmt.Sprintf(
+		"%s converged; healthy on %s", req.service, req.newDigest))
+}
+
 // applyMerged pulls the merged branch and walks it onto the host.
 func (e *Engine) applyMerged(ctx context.Context, req runRequest) error {
 	if _, err := e.opts.Repo.Sync(ctx); err != nil {
@@ -499,6 +561,13 @@ func (e *Engine) applyMerged(ctx context.Context, req runRequest) error {
 		return fmt.Errorf(
 			"merged manifest pins %s, not the requested %s", m.Image.Digest, req.newDigest)
 	}
+	return e.applyManifest(ctx, req, m)
+}
+
+// applyManifest walks one manifest onto the host, streaming the phases.
+func (e *Engine) applyManifest(
+	ctx context.Context, req runRequest, m *manifest.Manifest,
+) error {
 	tmpl, err := e.opts.Repo.Template(m.Template)
 	if err != nil {
 		return err
