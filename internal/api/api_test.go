@@ -68,6 +68,16 @@ func (e *fakeEngine) Rollback(_ context.Context, service, digest, actor string) 
 	return int64(len(e.calls)), e.joined, nil
 }
 
+func (e *fakeEngine) Converge(_ context.Context, service, actor string) (int64, bool, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.calls = append(e.calls, deployCall{service, "", actor, "converge"})
+	if e.err != nil {
+		return 0, false, e.err
+	}
+	return int64(len(e.calls)), e.joined, nil
+}
+
 func (e *fakeEngine) Drift(context.Context) (map[string]string, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -611,6 +621,40 @@ func TestRollbackWithoutDigestIsAllowed(t *testing.T) {
 	calls := h.engine.recorded()
 	if len(calls) != 1 || calls[0].Action != "rollback" || calls[0].Digest != "" {
 		t.Errorf("engine call = %+v", calls)
+	}
+}
+
+func TestConvergeTakesNoBodyAndDispatches(t *testing.T) {
+	h := newHarness(t)
+	resp := h.do(t, http.MethodPost, "/api/v1/services/web/converge", ``, remoteUser("admin"))
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("converge = %d, want 202", resp.StatusCode)
+	}
+	var body struct {
+		JournalID int64 `json:"journalId"`
+		Joined    bool  `json:"joined"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.JournalID == 0 {
+		t.Error("no journal id returned")
+	}
+	calls := h.engine.recorded()
+	if len(calls) != 1 || calls[0].Action != "converge" ||
+		calls[0].Service != "web" || calls[0].Digest != "" {
+		t.Errorf("engine call = %+v", calls)
+	}
+	if calls[0].Actor != "admin" {
+		t.Errorf("actor = %q", calls[0].Actor)
+	}
+}
+
+func TestConvergeOnAnUnknownServiceIsNotFound(t *testing.T) {
+	h := newHarness(t)
+	resp := h.do(t, http.MethodPost, "/api/v1/services/nope/converge", ``, remoteUser("admin"))
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("converge on unknown service = %d, want 404", resp.StatusCode)
 	}
 }
 

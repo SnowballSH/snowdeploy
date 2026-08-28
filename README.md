@@ -102,6 +102,7 @@ All JSON, all under `/api/v1`, all on the loopback listener.
 | `GET` | `/api/v1/services` | Every service with its running, merged, and latest-available digests, drift flag, and last receipt. |
 | `POST` | `/api/v1/services/{name}/deploy` | `{"digest": "sha256:…"}` → `{"journalId": N}`, `202`. |
 | `POST` | `/api/v1/services/{name}/rollback` | `{"digest": "sha256:…"}` (optional) → `{"journalId": N}`, `202`. |
+| `POST` | `/api/v1/services/{name}/converge` | No body. Re-applies the merged manifest without moving the pin → `{"journalId": N}`, `202`. |
 | `GET` | `/api/v1/services/{name}/history?n=20` | Newest-first receipts. |
 | `GET` | `/api/v1/events` | Server-sent `state` events for every transition. |
 | `GET` | `/healthz` | `200`, no identity required. |
@@ -122,14 +123,23 @@ address.
 snowdeploy status
 snowdeploy deploy   <service> [--digest sha256:…]
 snowdeploy rollback <service> [--to sha256:…]
+snowdeploy converge <service>
 snowdeploy history  <service> [-n 20]
 snowdeploy validate <dir> [--volume-prefixes p1,p2] [--env-file-prefixes p1,p2]
 ```
 
 `--server` and `--token-file` (or `SNOWDEPLOY_SERVER` and
-`SNOWDEPLOY_TOKEN_FILE`) point it at a daemon. `deploy` and `rollback` follow
-the event stream and exit non-zero unless the service ends healthy, so they
-work in a script.
+`SNOWDEPLOY_TOKEN_FILE`) point it at a daemon. `deploy`, `rollback`, and
+`converge` follow the event stream and exit non-zero unless the service ends
+healthy, so they work in a script.
+
+`converge` exists for the manifest change a deploy cannot carry: an env,
+volume, or template edit that merged without moving the image digest. It
+re-renders and re-applies the manifest as main has it — no pull request, since
+the change already went through review — and, unlike a deploy, it has no
+automatic rollback: the previously rendered unit is recorded nowhere, so a
+failed probe leaves the run `failed` with instructions rather than silently
+restoring anything.
 
 ## Security model
 

@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -145,6 +146,8 @@ type fakeDaemon struct {
 	deployPath  string
 	authSeen    string
 	rollbackHit bool
+	convergeHit bool
+	convergeRaw []byte
 	journalID   int64
 
 	states  []string
@@ -216,6 +219,17 @@ func (f *fakeDaemon) handler(t *testing.T) http.Handler {
 		f.mu.Unlock()
 		writeJSON(t, w, map[string]int64{"journalId": 8})
 		f.begun(8)
+	})
+
+	mux.HandleFunc("POST /api/v1/services/{name}/converge", func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		f.mu.Lock()
+		f.convergeHit = true
+		f.convergeRaw = raw
+		f.deployPath = r.URL.Path
+		f.mu.Unlock()
+		writeJSON(t, w, map[string]int64{"journalId": 9})
+		f.begun(9)
 	})
 
 	mux.HandleFunc("GET /api/v1/events", func(w http.ResponseWriter, r *http.Request) {
@@ -370,6 +384,51 @@ func TestRollbackWithoutTarget(t *testing.T) {
 	}
 	if f.deployBody["digest"] != "" {
 		t.Errorf("rollback sent a digest it was not given: %q", f.deployBody["digest"])
+	}
+}
+
+func TestConvergePostsNoBodyAndFollowsToHealthy(t *testing.T) {
+	f, url := newFakeDaemon(t, "reconciling", "probing", "healthy")
+
+	code, c := runCLI("converge", "web", "--server", url)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0\nstdout: %s\nstderr: %s",
+			code, c.out.String(), c.err.String())
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.convergeHit {
+		t.Fatal("converge endpoint not called")
+	}
+	if f.deployPath != "/api/v1/services/web/converge" {
+		t.Errorf("posted to %q", f.deployPath)
+	}
+	if len(f.convergeRaw) != 0 {
+		t.Errorf("converge sent a body it has no use for: %q", f.convergeRaw)
+	}
+	for _, want := range []string{"reconciling", "probing", "healthy"} {
+		if !strings.Contains(c.out.String(), want) {
+			t.Errorf("output missing state %q:\n%s", want, c.out.String())
+		}
+	}
+}
+
+func TestConvergeExitsNonZeroOnFailure(t *testing.T) {
+	_, url := newFakeDaemon(t, "reconciling", "failed")
+
+	code, c := runCLI("converge", "web", "--server", url)
+	if code == 0 {
+		t.Fatalf("a failed converge exited 0:\n%s", c.out.String())
+	}
+}
+
+func TestConvergeRefusesADigestFlag(t *testing.T) {
+	_, url := newFakeDaemon(t)
+
+	code, _ := runCLI("converge", "web", "--digest", "sha256:aaa", "--server", url)
+	if code != 2 {
+		t.Fatalf("converge with --digest = %d, want the usage exit code 2", code)
 	}
 }
 

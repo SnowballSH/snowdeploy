@@ -1,7 +1,8 @@
 // Package deploy is the merge-first state machine: it proposes a manifest
 // change, waits for the configuration repository's own checks, merges, applies
 // the merged state to the host, probes, and journals — rolling back and
-// reverting main when the probe fails.
+// reverting main when the probe fails. Converge is the one action that skips
+// the proposal: it re-applies what main already holds.
 package deploy
 
 import "github.com/SnowballSH/snowdeploy/internal/journal"

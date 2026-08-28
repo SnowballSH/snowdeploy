@@ -16,6 +16,7 @@ import (
 const (
 	ActionDeploy       = "deploy"
 	ActionRollback     = "rollback"
+	ActionConverge     = "converge"
 	ActionAutoRollback = "auto-rollback"
 )
 
@@ -147,6 +148,16 @@ func (j *Journal) SetPR(id int64, prNumber int) error {
 		UPDATE deploys SET pr_number = ?
 		WHERE id = ? AND finished_at IS NULL`,
 		prNumber, id)
+}
+
+// SetDigests rewrites an in-flight entry's digests, for the run whose target
+// is settled only at the front of the queue: a converge records the pin it
+// actually applied, not the one main held at click time.
+func (j *Journal) SetDigests(id int64, oldDigest, newDigest string) error {
+	return j.update(id, `
+		UPDATE deploys SET old_digest = ?, new_digest = ?
+		WHERE id = ? AND finished_at IS NULL`,
+		oldDigest, newDigest, id)
 }
 
 // SetMergeSHA records the merge commit an in-flight entry produced.

@@ -318,3 +318,36 @@ func TestOpenIsIdempotentAcrossRestart(t *testing.T) {
 		t.Errorf("journal did not survive restart: %+v", got)
 	}
 }
+
+func TestSetDigestsRewritesAnUnfinishedEntry(t *testing.T) {
+	j := open(t)
+	id, err := j.Begin(sample())
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	if err := j.SetDigests(id, "sha256:ccc", "sha256:ccc"); err != nil {
+		t.Fatalf("SetDigests: %v", err)
+	}
+	got, err := j.Recent("web", 10)
+	if err != nil {
+		t.Fatalf("Recent: %v", err)
+	}
+	if got[0].OldDigest != "sha256:ccc" || got[0].NewDigest != "sha256:ccc" {
+		t.Errorf("digests = %s -> %s, want the rewritten pin twice",
+			got[0].OldDigest, got[0].NewDigest)
+	}
+}
+
+func TestSetDigestsRefusesAFinishedReceipt(t *testing.T) {
+	j := open(t)
+	id, err := j.Begin(sample())
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	if err := j.Finish(id, StateHealthy, "done"); err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+	if err := j.SetDigests(id, "sha256:ccc", "sha256:ccc"); !errors.Is(err, ErrAlreadyFinished) {
+		t.Fatalf("SetDigests on a receipt = %v, want ErrAlreadyFinished", err)
+	}
+}
