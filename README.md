@@ -57,7 +57,7 @@ unknown keys so a typo can never silently disable a setting.
 | `github_app_id`, `github_install_id` | The App installation allowed to author manifest pull requests. |
 | `github_key_file` | The App private key. Read per operation, never cached. |
 | `github_owner`, `github_repo` | The repository the App may write to. |
-| `cli_token_hash_file` | SHA-256 hashes of accepted CLI tokens, one per line, each optionally followed by a label used as the journalled actor. |
+| `cli_token_hash_file` | SHA-256 hashes of accepted CLI tokens, one per line, each optionally followed by a label used as the journalled actor, and then by an optional `scope=<action>[,<action>]` field limiting the token to those actions. Absent means no CLI access; a file that is present but does not parse is a fatal configuration error. |
 | `poll_interval` | How often the registry is asked for new digests. |
 | `drift_interval` | How often running containers are compared to merged manifests. |
 | `check_poll_interval` | How often a pull request's checks are polled. |
@@ -112,6 +112,24 @@ Authentication is either `Authorization: Bearer <token>`, checked against the
 hashes in `cli_token_hash_file`, or a `Remote-User` header set by the
 authenticating proxy in front of the daemon. Neither present is `401`. The
 authenticated identity is recorded as the actor on every receipt.
+
+A hash line may end in `scope=converge`, or any comma-separated set of
+`deploy`, `rollback` and `converge`, in which case the token may take only
+those actions and any other is `403`. The label is everything between the hash
+and that field, so a label may contain spaces. A line with no `scope=` field is
+unscoped and may take every action, which is what every existing operator token
+is.
+
+The scope grammar fails closed, because a scope field misread as part of a
+label would leave the token unscoped. Any field that begins with `scope` in any
+case must be the line's last field and must be exactly
+`scope=<action>[,<action>]` naming known actions — `Scope=converge`,
+`scope:converge`, `scope = converge`, `scope=converge farm` and
+`scope=deploy,restart` are all configuration errors, not labels. The daemon
+refuses to start on a token hash file that does not parse; because the file is
+re-read on every request, one that stops parsing later refuses every bearer
+token with `401` and logs the reason once, while the `Remote-User` path keeps
+working. `scope=` with no action names is well formed and authorizes nothing.
 
 Because `Remote-User` is trusted, the listener must stay on loopback and must
 only be reachable through that proxy. The daemon refuses to start on any other
