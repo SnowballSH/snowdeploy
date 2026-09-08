@@ -184,9 +184,9 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /api/v1/services", s.authed(s.handleServices))
 	mux.Handle("GET /api/v1/services/{name}/history", s.authed(s.handleHistory))
 	mux.Handle("GET /api/v1/services/{name}/revisions", s.authed(s.handleRevisions))
-	mux.Handle("POST /api/v1/services/{name}/deploy", s.authed(s.handleDeploy))
-	mux.Handle("POST /api/v1/services/{name}/rollback", s.authed(s.handleRollback))
-	mux.Handle("POST /api/v1/services/{name}/converge", s.authed(s.handleConverge))
+	mux.Handle("POST /api/v1/services/{name}/deploy", s.authedFor(actionDeploy, s.handleDeploy))
+	mux.Handle("POST /api/v1/services/{name}/rollback", s.authedFor(actionRollback, s.handleRollback))
+	mux.Handle("POST /api/v1/services/{name}/converge", s.authedFor(actionConverge, s.handleConverge))
 	mux.Handle("GET /api/v1/events", s.authed(func(w http.ResponseWriter, r *http.Request, _ string) {
 		s.handleEvents(w, r)
 	}))
@@ -213,13 +213,38 @@ type actorHandler func(w http.ResponseWriter, r *http.Request, actor string)
 
 func (s *Server) authed(h actorHandler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		actor, ok := s.auth.actor(r)
+		actor, _, ok := s.identify(w, r)
 		if !ok {
-			writeError(w, http.StatusUnauthorized, errors.New("no authenticated identity"))
 			return
 		}
 		h(w, r, actor)
 	})
+}
+
+// authedFor guards a mutating route: the identity must also be allowed to take
+// that action, so a token issued for converge alone cannot move a pin.
+func (s *Server) authedFor(act action, h actorHandler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		actor, allowed, ok := s.identify(w, r)
+		if !ok {
+			return
+		}
+		if !allowed.allows(act) {
+			writeError(w, http.StatusForbidden,
+				fmt.Errorf("this token may not %s", act))
+			return
+		}
+		h(w, r, actor)
+	})
+}
+
+func (s *Server) identify(w http.ResponseWriter, r *http.Request) (string, scope, bool) {
+	actor, allowed, ok := s.auth.actor(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, errors.New("no authenticated identity"))
+		return "", nil, false
+	}
+	return actor, allowed, true
 }
 
 func (s *Server) handleServices(w http.ResponseWriter, r *http.Request, _ string) {

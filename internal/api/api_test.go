@@ -345,6 +345,129 @@ func TestMissingTokenHashFileDoesNotOpenTheDoor(t *testing.T) {
 	}
 }
 
+// addToken rewrites the harness's hash file with one more accepted token on
+// it, whose line carries everything in rest after the hash.
+func (h *harness) addToken(t *testing.T, token, rest string) {
+	t.Helper()
+	path := h.api.auth.tokenHashFile
+	existing, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read token hash file: %v", err)
+	}
+	sum := sha256.Sum256([]byte(token))
+	line := strings.TrimRight(hex.EncodeToString(sum[:])+" "+rest, " ") + "\n"
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatalf("chmod token hash file: %v", err)
+	}
+	if err := os.WriteFile(path, append(existing, line...), 0o600); err != nil {
+		t.Fatalf("write token hash file: %v", err)
+	}
+}
+
+func TestConvergeOnlyTokenIsScoped(t *testing.T) {
+	h := newHarness(t)
+	const scoped = "farm-converge-token"
+	h.addToken(t, scoped, "farm scope=converge")
+
+	convergeResp := h.do(t, http.MethodPost, "/api/v1/services/web/converge", ``, bearer(scoped))
+	if convergeResp.StatusCode != http.StatusAccepted {
+		t.Fatalf("converge with a converge-scoped token = %d, want 202", convergeResp.StatusCode)
+	}
+	deployResp := h.do(t, http.MethodPost, "/api/v1/services/web/deploy",
+		`{"digest":"`+digestLatest+`"}`, bearer(scoped))
+	if deployResp.StatusCode != http.StatusForbidden {
+		t.Errorf("deploy with a converge-scoped token = %d, want 403", deployResp.StatusCode)
+	}
+	rollbackResp := h.do(t, http.MethodPost, "/api/v1/services/web/rollback", ``, bearer(scoped))
+	if rollbackResp.StatusCode != http.StatusForbidden {
+		t.Errorf("rollback with a converge-scoped token = %d, want 403", rollbackResp.StatusCode)
+	}
+
+	calls := h.engine.recorded()
+	if len(calls) != 1 || calls[0].Action != "converge" || calls[0].Actor != "farm" {
+		t.Fatalf("a refused action still reached the engine, or the label was lost: %+v", calls)
+	}
+
+	if resp := h.do(t, http.MethodGet, "/api/v1/services", "", bearer(scoped)); resp.StatusCode != http.StatusOK {
+		t.Errorf("listing services with a converge-scoped token = %d, want 200", resp.StatusCode)
+	}
+
+	for _, tc := range []struct{ path, body string }{
+		{"/api/v1/services/web/converge", ``},
+		{"/api/v1/services/web/deploy", `{"digest":"` + digestLatest + `"}`},
+		{"/api/v1/services/web/rollback", ``},
+	} {
+		resp := h.do(t, http.MethodPost, tc.path, tc.body, bearer(h.token))
+		if resp.StatusCode != http.StatusAccepted {
+			t.Errorf("POST %s with an unscoped token = %d, want 202", tc.path, resp.StatusCode)
+		}
+	}
+}
+
+func TestTokenScopeAuthorizesEachActionItNames(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		rest     string
+		converge int
+		deploy   int
+		rollback int
+	}{
+		{"two actions", "farm scope=converge,rollback",
+			http.StatusAccepted, http.StatusForbidden, http.StatusAccepted},
+		{"no actions", "farm scope=",
+			http.StatusForbidden, http.StatusForbidden, http.StatusForbidden},
+		{"no label", "scope=deploy",
+			http.StatusForbidden, http.StatusAccepted, http.StatusForbidden},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			const token = "scoped-token"
+			h.addToken(t, token, tc.rest)
+
+			for _, action := range []struct {
+				path string
+				body string
+				want int
+			}{
+				{"/api/v1/services/web/converge", ``, tc.converge},
+				{"/api/v1/services/web/deploy", `{"digest":"` + digestLatest + `"}`, tc.deploy},
+				{"/api/v1/services/web/rollback", ``, tc.rollback},
+			} {
+				resp := h.do(t, http.MethodPost, action.path, action.body, bearer(token))
+				if resp.StatusCode != action.want {
+					t.Errorf("POST %s with %q = %d, want %d",
+						action.path, tc.rest, resp.StatusCode, action.want)
+				}
+			}
+		})
+	}
+}
+
+func TestTokenLabelMayContainSpaces(t *testing.T) {
+	h := newHarness(t)
+	const (
+		unscoped = "spaced-label-token"
+		scoped   = "spaced-label-scoped-token"
+	)
+	h.addToken(t, unscoped, "operator laptop")
+	h.addToken(t, scoped, "farm converge scope=converge")
+
+	resp := h.do(t, http.MethodPost, "/api/v1/services/web/deploy",
+		`{"digest":"`+digestLatest+`"}`, bearer(unscoped))
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("deploy with an unscoped spaced label = %d, want 202", resp.StatusCode)
+	}
+	resp = h.do(t, http.MethodPost, "/api/v1/services/web/converge", ``, bearer(scoped))
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("converge with a scoped spaced label = %d, want 202", resp.StatusCode)
+	}
+
+	calls := h.engine.recorded()
+	if len(calls) != 2 || calls[0].Actor != "operator laptop" || calls[1].Actor != "farm converge" {
+		t.Fatalf("spaced labels were not journalled verbatim: %+v", calls)
+	}
+}
+
 // ---- endpoints -------------------------------------------------------------
 
 func TestServicesListing(t *testing.T) {
