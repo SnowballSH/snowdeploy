@@ -34,7 +34,9 @@ github_repo: config
 # SHA-256 hashes of accepted CLI bearer tokens, one per line, each optionally
 # followed by a label used as the journalled actor and then by an optional
 # scope=deploy,rollback,converge field limiting that token to those actions.
-# Absent means no CLI access.
+# Absent means no CLI access. A scope field must be the line's last field and
+# exactly that spelling: a file that does not parse refuses every bearer token,
+# and the daemon will not start on one.
 cli_token_hash_file: /run/snowdeploy/cli-tokens.sha256
 
 # How often to ask the registry for new digests, to compare running containers

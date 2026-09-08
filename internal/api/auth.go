@@ -6,9 +6,12 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 )
 
 // remoteUserHeader is set by the fronting proxy after it has authenticated the
@@ -33,6 +36,12 @@ const (
 	actionConverge action = "converge"
 )
 
+var knownActions = map[action]bool{
+	actionDeploy:   true,
+	actionRollback: true,
+	actionConverge: true,
+}
+
 // scope is the set of actions an identity may take. A nil scope is unscoped
 // and allows every action, which is what an unlabelled hash line, an operator
 // token predating scopes, and the proxy-authenticated browser all carry.
@@ -44,6 +53,9 @@ func (s scope) allows(a action) bool { return s == nil || s[a] }
 // to what that actor is allowed to do.
 type authenticator struct {
 	tokenHashFile string
+
+	mu           sync.Mutex
+	loggedReason string
 }
 
 // actor returns the authenticated identity and its scope, or false. A bearer
@@ -69,8 +81,11 @@ func bearerToken(r *http.Request) (string, bool) {
 	return token, token != ""
 }
 
-// matchToken compares the token's hash against every hash on file. A missing
-// or unreadable file authenticates nobody.
+// matchToken compares the token's hash against every hash on file. A missing,
+// unreadable or malformed file authenticates nobody: the file is re-read per
+// request, so a scope field that stops parsing after the daemon started denies
+// every bearer rather than widening one, while the proxy path — which never
+// reaches here — keeps working until the operator repairs the file.
 func (a *authenticator) matchToken(token string) (string, scope, bool) {
 	if a.tokenHashFile == "" {
 		return "", nil, false
@@ -79,55 +94,135 @@ func (a *authenticator) matchToken(token string) (string, scope, bool) {
 	if err != nil {
 		return "", nil, false
 	}
+	lines, err := parseTokenHashFile(data)
+	if err != nil {
+		a.logRefusal(err)
+		return "", nil, false
+	}
 
 	sum := sha256.Sum256([]byte(token))
 	want := []byte(hex.EncodeToString(sum[:]))
 
-	scanner := bufio.NewScanner(bytes.NewReader(data))
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		hash, rest, _ := strings.Cut(line, " ")
-		if subtle.ConstantTimeCompare([]byte(strings.ToLower(hash)), want) == 1 {
-			label, allowed := splitScope(rest)
-			if label == "" {
-				label = cliActorFallback
-			}
-			return label, allowed, true
+	for _, line := range lines {
+		if subtle.ConstantTimeCompare([]byte(line.hash), want) == 1 {
+			return line.label, line.allowed, true
 		}
 	}
 	return "", nil, false
 }
 
-// splitScope separates a trailing scope field from the label it follows. A
-// label may itself contain spaces, so only the last field counts, and only
-// when it carries the prefix: everything else is label, and a line without a
-// scope field is unscoped.
-func splitScope(rest string) (string, scope) {
-	rest = strings.TrimSpace(rest)
-	cut := strings.LastIndexAny(rest, " \t")
-	last := rest[cut+1:]
-	if !strings.HasPrefix(last, scopePrefix) {
-		return rest, nil
+// logRefusal reports a malformed file once per distinct reason: the file is
+// read on every request, and one line per request would bury the log.
+func (a *authenticator) logRefusal(err error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.loggedReason == err.Error() {
+		return
 	}
-	label := ""
-	if cut >= 0 {
-		label = strings.TrimSpace(rest[:cut])
+	a.loggedReason = err.Error()
+	slog.Error("the CLI token hash file is malformed; every bearer token is refused until it is repaired",
+		"file", a.tokenHashFile, "error", err)
+}
+
+// ValidateCLITokenHashFile refuses a present but malformed token hash file at
+// start-up, so a mistyped scope field is a configuration error the operator
+// sees immediately rather than an authorization surprise later. An absent path
+// is valid and means no CLI access; a path that cannot be read yet is left to
+// the per-request read, which fails closed on its own.
+func ValidateCLITokenHashFile(path string) error {
+	if path == "" {
+		return nil
 	}
-	return label, parseScope(strings.TrimPrefix(last, scopePrefix))
+	data, err := os.ReadFile(path) // #nosec G304 -- operator-configured path
+	if err != nil {
+		return nil
+	}
+	if _, err := parseTokenHashFile(data); err != nil {
+		return fmt.Errorf("cli_token_hash_file %s: %w", path, err)
+	}
+	return nil
+}
+
+// tokenLine is one accepted hash with the identity and the authorization it
+// carries.
+type tokenLine struct {
+	hash    string
+	label   string
+	allowed scope
+}
+
+// parseTokenHashFile reads every hash line, or refuses the whole file. The
+// grammar is a hash, an optional label that may contain spaces, and an
+// optional trailing scope=<comma-separated actions> field; a field that looks
+// like a scope field but is not exactly that — a different case, a colon,
+// spaces around the equals sign, a field before the label — is an error rather
+// than part of the label, because reading it as a label would silently leave
+// the token unscoped.
+func parseTokenHashFile(data []byte) ([]tokenLine, error) {
+	var lines []tokenLine
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	for number := 1; scanner.Scan(); number++ {
+		text := strings.TrimSpace(scanner.Text())
+		if text == "" || strings.HasPrefix(text, "#") {
+			continue
+		}
+		line, err := parseTokenLine(text)
+		if err != nil {
+			return nil, fmt.Errorf("line %d: %w", number, err)
+		}
+		lines = append(lines, line)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return lines, nil
+}
+
+func parseTokenLine(text string) (tokenLine, error) {
+	fields := strings.Fields(text)
+	line := tokenLine{hash: strings.ToLower(fields[0]), label: cliActorFallback}
+	rest := fields[1:]
+
+	for i, field := range rest {
+		if !strings.HasPrefix(strings.ToLower(field), "scope") {
+			continue
+		}
+		if i != len(rest)-1 {
+			return tokenLine{}, fmt.Errorf(
+				"%q is not the last field; a scope field follows the label", field)
+		}
+		if !strings.HasPrefix(field, scopePrefix) {
+			return tokenLine{}, fmt.Errorf(
+				"%q is not a scope field; write scope=<action>[,<action>]", field)
+		}
+		allowed, err := parseScope(strings.TrimPrefix(field, scopePrefix))
+		if err != nil {
+			return tokenLine{}, err
+		}
+		line.allowed = allowed
+		rest = rest[:i]
+		break
+	}
+
+	if label := strings.Join(rest, " "); label != "" {
+		line.label = label
+	}
+	return line, nil
 }
 
 // parseScope reads the comma-separated action names of a scope field. An
-// unrecognised or empty field authorizes nothing, so a typo denies rather
-// than widens.
-func parseScope(field string) scope {
+// unknown name is an error, not a narrower scope: a typo must be visible. A
+// field naming nothing at all authorizes nothing.
+func parseScope(field string) (scope, error) {
 	allowed := scope{}
-	for name := range strings.SplitSeq(field, ",") {
-		if name = strings.TrimSpace(name); name != "" {
-			allowed[action(name)] = true
-		}
+	if field == "" {
+		return allowed, nil
 	}
-	return allowed
+	for name := range strings.SplitSeq(field, ",") {
+		if !knownActions[action(name)] {
+			return nil, fmt.Errorf("%q is not an action this daemon offers", name)
+		}
+		allowed[action(name)] = true
+	}
+	return allowed, nil
 }

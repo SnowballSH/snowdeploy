@@ -443,6 +443,95 @@ func TestTokenScopeAuthorizesEachActionItNames(t *testing.T) {
 	}
 }
 
+// The forms below all used to read as part of the label, which left the token
+// unscoped: a mistyped scope field widened it instead of narrowing it.
+var malformedScopeFields = []struct {
+	name string
+	rest string
+}{
+	{"wrong case", "farm Scope=converge"},
+	{"colon", "farm scope:converge"},
+	{"spaces around the equals sign", "farm scope = converge"},
+	{"scope before the label", "scope=converge farm"},
+	{"unknown action", "farm scope=deploy,restart"},
+	{"scope-like field that is not one", "farm scopes=converge"},
+}
+
+func TestMalformedScopeFieldIsRefusedAtStartUp(t *testing.T) {
+	for _, tc := range malformedScopeFields {
+		t.Run(tc.name, func(t *testing.T) {
+			sum := sha256.Sum256([]byte("any-token"))
+			path := filepath.Join(t.TempDir(), "token.sha256")
+			if err := os.WriteFile(path,
+				[]byte(hex.EncodeToString(sum[:])+" "+tc.rest+"\n"), 0o600); err != nil {
+				t.Fatalf("write token hash file: %v", err)
+			}
+			if err := ValidateCLITokenHashFile(path); err == nil {
+				t.Fatalf("%q was accepted at start-up; a scope field that does not parse must be fatal", tc.rest)
+			}
+		})
+	}
+}
+
+func TestAbsentTokenHashFileIsValidAtStartUp(t *testing.T) {
+	if err := ValidateCLITokenHashFile(""); err != nil {
+		t.Fatalf("an absent cli_token_hash_file is no CLI access, not an error: %v", err)
+	}
+	if err := ValidateCLITokenHashFile(filepath.Join(t.TempDir(), "gone.sha256")); err != nil {
+		t.Fatalf("an unreadable file is left to the per-request read, which fails closed: %v", err)
+	}
+}
+
+func TestWellFormedScopeFieldsAreAcceptedAtStartUp(t *testing.T) {
+	sum := sha256.Sum256([]byte("any-token"))
+	hash := hex.EncodeToString(sum[:])
+	path := filepath.Join(t.TempDir(), "token.sha256")
+	body := "# operator-placed\n\n" +
+		hash + " mac\n" +
+		hash + " farm scope=converge\n" +
+		hash + " farm converge scope=converge,rollback\n" +
+		hash + " scope=deploy\n" +
+		hash + " farm scope=\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write token hash file: %v", err)
+	}
+	if err := ValidateCLITokenHashFile(path); err != nil {
+		t.Fatalf("a well-formed file was refused: %v", err)
+	}
+}
+
+// A malformed line that appears while the daemon is running cannot abort it:
+// the file is re-read per request, and the proxy-authenticated path must keep
+// working while the operator repairs the file.
+func TestMalformedScopeFieldRefusesEveryBearerAtRuntime(t *testing.T) {
+	for _, tc := range malformedScopeFields {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			h.addToken(t, "scoped-token", tc.rest)
+
+			resp := h.do(t, http.MethodPost, "/api/v1/services/web/deploy",
+				`{"digest":"`+digestLatest+`"}`, bearer("scoped-token"))
+			if resp.StatusCode != http.StatusUnauthorized {
+				t.Errorf("deploy with %q = %d, want 401", tc.rest, resp.StatusCode)
+			}
+			resp = h.do(t, http.MethodPost, "/api/v1/services/web/deploy",
+				`{"digest":"`+digestLatest+`"}`, bearer(h.token))
+			if resp.StatusCode != http.StatusUnauthorized {
+				t.Errorf("the file's other tokens still authenticated: %d, want 401", resp.StatusCode)
+			}
+			if calls := h.engine.recorded(); len(calls) != 0 {
+				t.Fatalf("a bearer reached the engine through a malformed file: %v", calls)
+			}
+
+			resp = h.do(t, http.MethodPost, "/api/v1/services/web/deploy",
+				`{"digest":"`+digestLatest+`"}`, remoteUser("admin"))
+			if resp.StatusCode != http.StatusAccepted {
+				t.Errorf("the proxy path went down with the malformed file: %d, want 202", resp.StatusCode)
+			}
+		})
+	}
+}
+
 func TestTokenLabelMayContainSpaces(t *testing.T) {
 	h := newHarness(t)
 	const (
