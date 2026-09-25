@@ -128,6 +128,40 @@ func TestVolumePrefixesMustBeAbsolute(t *testing.T) {
 	}
 }
 
+func TestProxyBoundaryKeysLoadTogether(t *testing.T) {
+	cfg, err := Load(write(t, minimal+
+		"proxy_secret_file: /etc/snowdeploy/proxy-secret\nproxy_allowed_users: [admin]\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ProxySecretFile != "/etc/snowdeploy/proxy-secret" {
+		t.Errorf("ProxySecretFile = %q", cfg.ProxySecretFile)
+	}
+	if len(cfg.ProxyAllowedUsers) != 1 || cfg.ProxyAllowedUsers[0] != "admin" {
+		t.Errorf("ProxyAllowedUsers = %q", cfg.ProxyAllowedUsers)
+	}
+}
+
+func TestProxyBoundaryKeysMustComeTogether(t *testing.T) {
+	for name, extra := range map[string]string{
+		"secret alone": "proxy_secret_file: /etc/snowdeploy/proxy-secret\n",
+		"users alone":  "proxy_allowed_users: [admin]\n",
+	} {
+		_, err := Load(write(t, minimal+extra))
+		if err == nil || !strings.Contains(err.Error(), "set together") {
+			t.Errorf("%s: err = %v, want the pairing refusal", name, err)
+		}
+	}
+}
+
+func TestProxySecretFileMustBeAbsolute(t *testing.T) {
+	_, err := Load(write(t, minimal+
+		"proxy_secret_file: proxy-secret\nproxy_allowed_users: [admin]\n"))
+	if err == nil || !strings.Contains(err.Error(), "absolute") {
+		t.Fatalf("relative proxy_secret_file: err = %v", err)
+	}
+}
+
 func TestLoadMissingFile(t *testing.T) {
 	if _, err := Load(filepath.Join(t.TempDir(), "absent.yaml")); err == nil {
 		t.Fatal("missing config file accepted")

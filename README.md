@@ -109,9 +109,26 @@ All JSON, all under `/api/v1`, all on the loopback listener.
 | `GET` | `/metrics` | Prometheus, on the **metrics** listener only. |
 
 Authentication is either `Authorization: Bearer <token>`, checked against the
-hashes in `cli_token_hash_file`, or a `Remote-User` header set by the
-authenticating proxy in front of the daemon. Neither present is `401`. The
-authenticated identity is recorded as the actor on every receipt.
+hashes in `cli_token_hash_file`, or an identity asserted by the authenticating
+proxy in front of the daemon. Neither is `401`, and a request that carries a
+bearer is judged by it alone. The authenticated identity is recorded as the
+actor on every receipt.
+
+The proxy path is closed unless `proxy_secret_file` and `proxy_allowed_users`
+are both configured. It then needs exactly one `X-Snowdeploy-Proxy-Secret`
+header matching the file and exactly one `Remote-User` header naming a listed
+user; anything else is `401`, logged with the reason and never the values. The
+secret is what proves a request came through the proxy: the daemon only binds
+loopback, but every process and container sharing the host's network can reach
+loopback and set `Remote-User`. The proxy must overwrite both headers, never
+append, and must be the only holder of the secret besides the daemon, which
+reads it once at start-up. With Caddy in front:
+
+```
+reverse_proxy 127.0.0.1:8092 {
+	header_up X-Snowdeploy-Proxy-Secret {file./etc/caddy/secrets/deploy-proxy-secret}
+}
+```
 
 A hash line may end in `scope=converge`, or any comma-separated set of
 `deploy`, `rollback` and `converge`, in which case the token may take only
@@ -131,9 +148,9 @@ re-read on every request, one that stops parsing later refuses every bearer
 token with `401` and logs the reason once, while the `Remote-User` path keeps
 working. `scope=` with no action names is well formed and authorizes nothing.
 
-Because `Remote-User` is trusted, the listener must stay on loopback and must
-only be reachable through that proxy. The daemon refuses to start on any other
-address.
+The listener must stay on loopback, and the daemon refuses to start on any
+other address. Loopback narrows who can connect; the shared secret, not the
+address, is what lets a `Remote-User` in.
 
 ## CLI
 
