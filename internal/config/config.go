@@ -53,6 +53,13 @@ type Config struct {
 	GitHubRepo       string `yaml:"github_repo"`
 	CLITokenHashFile string `yaml:"cli_token_hash_file"`
 
+	// ProxySecretFile and ProxyAllowedUsers open the browser path together:
+	// a Remote-User identity is believed only beside the secret the fronting
+	// proxy presents, and only for a listed user. Neither set leaves bearer
+	// tokens as the only way in.
+	ProxySecretFile   string   `yaml:"proxy_secret_file"`
+	ProxyAllowedUsers []string `yaml:"proxy_allowed_users"`
+
 	PollInterval      time.Duration `yaml:"poll_interval"`
 	DriftInterval     time.Duration `yaml:"drift_interval"`
 	CheckPollInterval time.Duration `yaml:"check_poll_interval"`
@@ -148,6 +155,14 @@ func (c *Config) validate() error {
 	}
 	if c.GitHubInstallID == 0 {
 		fail("github_install_id is required")
+	}
+
+	hasSecret, hasUsers := c.ProxySecretFile != "", len(c.ProxyAllowedUsers) > 0
+	if hasSecret != hasUsers {
+		fail("proxy_secret_file and proxy_allowed_users must be set together")
+	}
+	if hasSecret && !strings.HasPrefix(c.ProxySecretFile, "/") {
+		fail("proxy_secret_file %q is not an absolute path", c.ProxySecretFile)
 	}
 
 	for _, p := range c.VolumePrefixes {

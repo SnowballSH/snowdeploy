@@ -39,6 +39,16 @@ github_repo: config
 # and the daemon will not start on one.
 cli_token_hash_file: /run/snowdeploy/cli-tokens.sha256
 
+# The browser path: a Remote-User identity from the authenticating proxy is
+# believed only beside this shared secret, which the proxy presents as
+# X-Snowdeploy-Proxy-Secret, and only for a listed user. Both keys or neither;
+# with neither, only bearer tokens authenticate. The file holds at least 32
+# bytes, is read once at start-up, and must be readable by nothing but the
+# daemon and the proxy.
+proxy_secret_file: /etc/snowdeploy/proxy-secret
+proxy_allowed_users:
+  - admin
+
 # How often to ask the registry for new digests, to compare running containers
 # against merged manifests, and to poll a pull request's checks.
 poll_interval: 5m

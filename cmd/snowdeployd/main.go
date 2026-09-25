@@ -59,12 +59,16 @@ func run() error {
 	if err := api.ValidateCLITokenHashFile(cfg.CLITokenHashFile); err != nil {
 		return err
 	}
+	proxy, err := proxyBoundary(cfg)
+	if err != nil {
+		return err
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(),
 		os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	d, err := build(ctx, cfg)
+	d, err := build(ctx, cfg, proxy)
 	if err != nil {
 		return err
 	}
@@ -90,7 +94,7 @@ func (d *daemon) close() {
 	}
 }
 
-func build(ctx context.Context, cfg *config.Config) (*daemon, error) {
+func build(ctx context.Context, cfg *config.Config, proxy *api.ProxyBoundary) (*daemon, error) {
 	if err := ensureDir(filepath.Dir(cfg.JournalPath)); err != nil {
 		return nil, err
 	}
@@ -159,6 +163,7 @@ func build(ctx context.Context, cfg *config.Config) (*daemon, error) {
 		Watcher:          watcher,
 		History:          jrnl,
 		CLITokenHashFile: cfg.CLITokenHashFile,
+		Proxy:            proxy,
 		UI:               api.UI(),
 		Revisions:        revisions,
 		RepoWebURL:       repoWebURL,
@@ -193,6 +198,26 @@ func build(ctx context.Context, cfg *config.Config) (*daemon, error) {
 	return &daemon{
 		jrnl: jrnl, repo: repo, engine: engine, server: server, watcher: watcher,
 	}, nil
+}
+
+// proxyBoundary opens the browser path only when the configuration asks for
+// it, and refuses to start on a secret it cannot read rather than quietly
+// leaving the path closed. The secret is read once: rotating it is a restart.
+func proxyBoundary(cfg *config.Config) (*api.ProxyBoundary, error) {
+	if cfg.ProxySecretFile == "" {
+		slog.Warn("no proxy_secret_file is configured: the Remote-User browser path is closed " +
+			"and only bearer tokens authenticate")
+		return nil, nil
+	}
+	secret, err := api.LoadProxySecret(cfg.ProxySecretFile)
+	if err != nil {
+		return nil, fmt.Errorf("proxy_secret_file: %w", err)
+	}
+	boundary, err := api.NewProxyBoundary(secret, cfg.ProxyAllowedUsers)
+	if err != nil {
+		return nil, fmt.Errorf("proxy_allowed_users: %w", err)
+	}
+	return boundary, nil
 }
 
 // failOrphanedDeploys closes out journal rows a previous process left

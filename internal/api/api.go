@@ -1,7 +1,7 @@
 // Package api is the daemon's HTTP surface: a small JSON API, a live event
 // stream, and a separate Prometheus listener. Authentication is either a
 // bearer token whose hash the operator placed on disk, or the identity a
-// fronting proxy has already established.
+// fronting proxy has already established, proved by a secret shared with it.
 package api
 
 import (
@@ -115,7 +115,11 @@ type Options struct {
 	Watcher          Watcher
 	History          History
 	CLITokenHashFile string
-	UI               http.Handler
+
+	// Proxy admits identities asserted by the fronting proxy. Nil leaves
+	// bearer tokens as the only way in.
+	Proxy *ProxyBoundary
+	UI    http.Handler
 
 	// RepoWebURL is the configuration repository's web address, threaded to
 	// clients and used to rebuild event links for snapshot frames.
@@ -138,7 +142,7 @@ type Server struct {
 func New(opts Options) *Server {
 	s := &Server{
 		opts: opts,
-		auth: &authenticator{tokenHashFile: opts.CLITokenHashFile},
+		auth: &authenticator{tokenHashFile: opts.CLITokenHashFile, proxy: opts.Proxy},
 	}
 	s.metrics = newMetrics(func() float64 {
 		if opts.Engine == nil {

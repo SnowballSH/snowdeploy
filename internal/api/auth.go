@@ -15,8 +15,9 @@ import (
 )
 
 // remoteUserHeader is set by the fronting proxy after it has authenticated the
-// browser session. It is trustworthy only because the API listens on loopback
-// and nothing but the proxy can reach it.
+// browser session. It is believed only beside the proxy's shared secret: a
+// loopback listener is reachable from every process and container sharing the
+// host's network, any of which can set this header.
 const remoteUserHeader = "Remote-User"
 
 // cliActorFallback labels a bearer token whose hash line carries no label.
@@ -54,21 +55,27 @@ func (s scope) allows(a action) bool { return s == nil || s[a] }
 type authenticator struct {
 	tokenHashFile string
 
+	// proxy admits the browser path. Nil closes it: only bearer tokens
+	// authenticate.
+	proxy *ProxyBoundary
+
 	mu           sync.Mutex
 	loggedReason string
 }
 
 // actor returns the authenticated identity and its scope, or false. A bearer
 // token is checked against SHA-256 hashes on disk, so no token is ever stored;
-// the proxy header is the browser path. Neither present means no identity.
+// the proxy boundary is the browser path. A request carrying a bearer is
+// judged by it alone.
 func (a *authenticator) actor(r *http.Request) (string, scope, bool) {
 	if token, ok := bearerToken(r); ok {
 		return a.matchToken(token)
 	}
-	if user := strings.TrimSpace(r.Header.Get(remoteUserHeader)); user != "" {
-		return user, nil, true
+	if a.proxy == nil {
+		return "", nil, false
 	}
-	return "", nil, false
+	user, ok := a.proxy.identity(r)
+	return user, nil, ok
 }
 
 func bearerToken(r *http.Request) (string, bool) {

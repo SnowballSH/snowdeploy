@@ -218,6 +218,11 @@ func newHarnessWithSource(t *testing.T, repo Repo, revisions revision.Source) *h
 		t.Fatalf("write token hash: %v", err)
 	}
 
+	proxy, err := NewProxyBoundary([]byte(testProxySecret), []string{"admin"})
+	if err != nil {
+		t.Fatalf("NewProxyBoundary: %v", err)
+	}
+
 	eng := &fakeEngine{}
 	api := New(Options{
 		Engine:           eng,
@@ -226,6 +231,7 @@ func newHarnessWithSource(t *testing.T, repo Repo, revisions revision.Source) *h
 		Watcher:          fakeWatcher{},
 		History:          j,
 		CLITokenHashFile: hashFile,
+		Proxy:            proxy,
 		Revisions:        revisions,
 		RepoWebURL:       testRepoWebURL,
 	})
@@ -259,7 +265,6 @@ func (h *harness) do(t *testing.T, method, path string, body string, headers map
 	return resp
 }
 
-func remoteUser(name string) map[string]string { return map[string]string{"Remote-User": name} }
 func bearer(tok string) map[string]string {
 	return map[string]string{"Authorization": "Bearer " + tok}
 }
@@ -293,19 +298,6 @@ func TestHealthzNeedsNoIdentity(t *testing.T) {
 	resp := h.do(t, http.MethodGet, "/healthz", "", nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("/healthz = %d, want 200", resp.StatusCode)
-	}
-}
-
-func TestRemoteUserBecomesTheActor(t *testing.T) {
-	h := newHarness(t)
-	resp := h.do(t, http.MethodPost, "/api/v1/services/web/deploy",
-		`{"digest":"`+digestLatest+`"}`, remoteUser("admin"))
-	if resp.StatusCode != http.StatusAccepted {
-		t.Fatalf("deploy = %d, want 202", resp.StatusCode)
-	}
-	calls := h.engine.recorded()
-	if len(calls) != 1 || calls[0].Actor != "admin" {
-		t.Fatalf("actor not attributed: %+v", calls)
 	}
 }
 
@@ -524,7 +516,7 @@ func TestMalformedScopeFieldRefusesEveryBearerAtRuntime(t *testing.T) {
 			}
 
 			resp = h.do(t, http.MethodPost, "/api/v1/services/web/deploy",
-				`{"digest":"`+digestLatest+`"}`, remoteUser("admin"))
+				`{"digest":"`+digestLatest+`"}`, proxied("admin"))
 			if resp.StatusCode != http.StatusAccepted {
 				t.Errorf("the proxy path went down with the malformed file: %d, want 202", resp.StatusCode)
 			}
@@ -561,7 +553,7 @@ func TestTokenLabelMayContainSpaces(t *testing.T) {
 
 func TestServicesListing(t *testing.T) {
 	h := newHarness(t)
-	resp := h.do(t, http.MethodGet, "/api/v1/services", "", remoteUser("admin"))
+	resp := h.do(t, http.MethodGet, "/api/v1/services", "", proxied("admin"))
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("GET /services = %d", resp.StatusCode)
 	}
@@ -592,7 +584,7 @@ func TestServicesListing(t *testing.T) {
 // for it would make "unlabelled" indistinguishable from "labelled as empty".
 func TestServiceStatusCarriesRevisionsForKnownDigestsOnly(t *testing.T) {
 	h := newHarness(t)
-	resp := h.do(t, http.MethodGet, "/api/v1/services", "", remoteUser("admin"))
+	resp := h.do(t, http.MethodGet, "/api/v1/services", "", proxied("admin"))
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("GET /services = %d", resp.StatusCode)
 	}
@@ -622,7 +614,7 @@ func TestRevisionsEndpointMapsKnownDigestsAndOmitsTheRest(t *testing.T) {
 	h := newHarness(t)
 	resp := h.do(t, http.MethodGet,
 		"/api/v1/services/web/revisions?digests="+digestManifest+","+digestRunning,
-		"", remoteUser("admin"))
+		"", proxied("admin"))
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("GET /revisions = %d", resp.StatusCode)
 	}
@@ -658,7 +650,7 @@ func TestRevisionsEndpointValidatesItsDigests(t *testing.T) {
 		"empty entry":    "?digests=" + digestManifest + ",",
 	} {
 		resp := h.do(t, http.MethodGet, "/api/v1/services/web/revisions"+query,
-			"", remoteUser("admin"))
+			"", proxied("admin"))
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Errorf("%s = %d, want 400", name, resp.StatusCode)
 		}
@@ -674,14 +666,14 @@ func TestRevisionsEndpointCapsTheDigestCount(t *testing.T) {
 	}
 	resp := h.do(t, http.MethodGet,
 		"/api/v1/services/web/revisions?digests="+strings.Join(digests, ","),
-		"", remoteUser("admin"))
+		"", proxied("admin"))
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("%d digests = %d, want 400", maxRevisionDigests+1, resp.StatusCode)
 	}
 
 	resp = h.do(t, http.MethodGet,
 		"/api/v1/services/web/revisions?digests="+strings.Join(digests[1:], ","),
-		"", remoteUser("admin"))
+		"", proxied("admin"))
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("%d digests = %d, want 200", maxRevisionDigests, resp.StatusCode)
 	}
@@ -690,7 +682,7 @@ func TestRevisionsEndpointCapsTheDigestCount(t *testing.T) {
 func TestRevisionsEndpointRejectsAnUnknownService(t *testing.T) {
 	h := newHarness(t)
 	resp := h.do(t, http.MethodGet,
-		"/api/v1/services/nope/revisions?digests="+digestManifest, "", remoteUser("admin"))
+		"/api/v1/services/nope/revisions?digests="+digestManifest, "", proxied("admin"))
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("unknown service = %d, want 404", resp.StatusCode)
 	}
@@ -701,7 +693,7 @@ func TestRevisionsEndpointRejectsAnUnknownService(t *testing.T) {
 func TestNilRevisionSourceDegradesToAbsentFields(t *testing.T) {
 	h := newHarnessWithSource(t, fakeRepo{}, nil)
 
-	resp := h.do(t, http.MethodGet, "/api/v1/services", "", remoteUser("admin"))
+	resp := h.do(t, http.MethodGet, "/api/v1/services", "", proxied("admin"))
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("GET /services = %d", resp.StatusCode)
 	}
@@ -714,7 +706,7 @@ func TestNilRevisionSourceDegradesToAbsentFields(t *testing.T) {
 	}
 
 	resp = h.do(t, http.MethodGet,
-		"/api/v1/services/web/revisions?digests="+digestManifest, "", remoteUser("admin"))
+		"/api/v1/services/web/revisions?digests="+digestManifest, "", proxied("admin"))
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("GET /revisions = %d, want 200", resp.StatusCode)
 	}
@@ -743,7 +735,7 @@ func TestStatusRevisionLookupsShareOneBudget(t *testing.T) {
 	h := newHarnessWithSource(t, fakeRepo{}, blockingRevisions{})
 
 	start := time.Now()
-	resp := h.do(t, http.MethodGet, "/api/v1/services", "", remoteUser("admin"))
+	resp := h.do(t, http.MethodGet, "/api/v1/services", "", proxied("admin"))
 	elapsed := time.Since(start)
 
 	if resp.StatusCode != http.StatusOK {
@@ -764,7 +756,7 @@ func TestStatusRevisionLookupsShareOneBudget(t *testing.T) {
 
 func TestDeployRequiresADigest(t *testing.T) {
 	h := newHarness(t)
-	resp := h.do(t, http.MethodPost, "/api/v1/services/web/deploy", `{}`, remoteUser("admin"))
+	resp := h.do(t, http.MethodPost, "/api/v1/services/web/deploy", `{}`, proxied("admin"))
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("deploy with no digest = %d, want 400", resp.StatusCode)
 	}
@@ -773,7 +765,7 @@ func TestDeployRequiresADigest(t *testing.T) {
 func TestDeployPassesTheDigestThrough(t *testing.T) {
 	h := newHarness(t)
 	resp := h.do(t, http.MethodPost, "/api/v1/services/web/deploy",
-		`{"digest":"`+digestLatest+`"}`, remoteUser("admin"))
+		`{"digest":"`+digestLatest+`"}`, proxied("admin"))
 	if resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("deploy = %d", resp.StatusCode)
 	}
@@ -808,7 +800,7 @@ func TestJoinedDeployIsReportedAsJoined(t *testing.T) {
 	h.engine.mu.Unlock()
 
 	resp := h.do(t, http.MethodPost, "/api/v1/services/web/deploy",
-		`{"digest":"`+digestLatest+`"}`, remoteUser("admin"))
+		`{"digest":"`+digestLatest+`"}`, proxied("admin"))
 	if resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("deploy = %d, want 202", resp.StatusCode)
 	}
@@ -826,7 +818,7 @@ func TestJoinedDeployIsReportedAsJoined(t *testing.T) {
 
 func TestRollbackWithoutDigestIsAllowed(t *testing.T) {
 	h := newHarness(t)
-	resp := h.do(t, http.MethodPost, "/api/v1/services/web/rollback", `{}`, remoteUser("admin"))
+	resp := h.do(t, http.MethodPost, "/api/v1/services/web/rollback", `{}`, proxied("admin"))
 	if resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("rollback = %d, want 202", resp.StatusCode)
 	}
@@ -838,7 +830,7 @@ func TestRollbackWithoutDigestIsAllowed(t *testing.T) {
 
 func TestConvergeTakesNoBodyAndDispatches(t *testing.T) {
 	h := newHarness(t)
-	resp := h.do(t, http.MethodPost, "/api/v1/services/web/converge", ``, remoteUser("admin"))
+	resp := h.do(t, http.MethodPost, "/api/v1/services/web/converge", ``, proxied("admin"))
 	if resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("converge = %d, want 202", resp.StatusCode)
 	}
@@ -864,7 +856,7 @@ func TestConvergeTakesNoBodyAndDispatches(t *testing.T) {
 
 func TestConvergeOnAnUnknownServiceIsNotFound(t *testing.T) {
 	h := newHarness(t)
-	resp := h.do(t, http.MethodPost, "/api/v1/services/nope/converge", ``, remoteUser("admin"))
+	resp := h.do(t, http.MethodPost, "/api/v1/services/nope/converge", ``, proxied("admin"))
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("converge on unknown service = %d, want 404", resp.StatusCode)
 	}
@@ -875,7 +867,7 @@ func TestEngineErrorSurfacesAsBadRequest(t *testing.T) {
 	h.engine.err = errors.New("service is already pinned to that digest")
 
 	resp := h.do(t, http.MethodPost, "/api/v1/services/web/deploy",
-		`{"digest":"`+digestLatest+`"}`, remoteUser("admin"))
+		`{"digest":"`+digestLatest+`"}`, proxied("admin"))
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("engine error = %d, want 400", resp.StatusCode)
 	}
@@ -901,7 +893,7 @@ func TestHistoryReturnsJournalEntries(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	resp := h.do(t, http.MethodGet, "/api/v1/services/web/history?n=5", "", remoteUser("admin"))
+	resp := h.do(t, http.MethodGet, "/api/v1/services/web/history?n=5", "", proxied("admin"))
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("history = %d", resp.StatusCode)
 	}
@@ -917,7 +909,7 @@ func TestHistoryReturnsJournalEntries(t *testing.T) {
 func TestUnknownServiceIsNotFound(t *testing.T) {
 	h := newHarness(t)
 	resp := h.do(t, http.MethodPost, "/api/v1/services/nope/deploy",
-		`{"digest":"`+digestLatest+`"}`, remoteUser("admin"))
+		`{"digest":"`+digestLatest+`"}`, proxied("admin"))
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("unknown service = %d, want 404", resp.StatusCode)
 	}
@@ -945,7 +937,7 @@ func TestDeployAgainstAnUnreadRepositoryIsNotAMissingService(t *testing.T) {
 	h := newHarnessWithRepo(t, unsyncedRepo{})
 
 	resp := h.do(t, http.MethodPost, "/api/v1/services/portfolio/deploy",
-		`{"digest":"`+digestLatest+`"}`, remoteUser("admin"))
+		`{"digest":"`+digestLatest+`"}`, proxied("admin"))
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("deploy against an unread repository = %d, want 503", resp.StatusCode)
 	}
@@ -967,7 +959,7 @@ func TestDeployAgainstAnUnreadRepositoryIsNotAMissingService(t *testing.T) {
 func TestUnknownServiceStaysDistinctFromAnUnreadRepository(t *testing.T) {
 	known := newHarness(t)
 	resp := known.do(t, http.MethodPost, "/api/v1/services/nope/deploy",
-		`{"digest":"`+digestLatest+`"}`, remoteUser("admin"))
+		`{"digest":"`+digestLatest+`"}`, proxied("admin"))
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("unknown service on a read repository = %d, want 404", resp.StatusCode)
 	}
@@ -977,7 +969,7 @@ func TestUnknownServiceStaysDistinctFromAnUnreadRepository(t *testing.T) {
 
 	unread := newHarnessWithRepo(t, unsyncedRepo{})
 	resp = unread.do(t, http.MethodPost, "/api/v1/services/nope/deploy",
-		`{"digest":"`+digestLatest+`"}`, remoteUser("admin"))
+		`{"digest":"`+digestLatest+`"}`, proxied("admin"))
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("same name on an unread repository = %d, want 503", resp.StatusCode)
 	}
@@ -988,7 +980,7 @@ func TestUnknownServiceStaysDistinctFromAnUnreadRepository(t *testing.T) {
 func TestServiceListSaysWhyItHasNothingToList(t *testing.T) {
 	h := newHarnessWithRepo(t, unsyncedRepo{})
 
-	resp := h.do(t, http.MethodGet, "/api/v1/services", "", remoteUser("admin"))
+	resp := h.do(t, http.MethodGet, "/api/v1/services", "", proxied("admin"))
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("GET /services on an unread repository = %d, want 503", resp.StatusCode)
 	}
@@ -1003,7 +995,7 @@ func TestTheSyncErrorTextNeverReachesTheClient(t *testing.T) {
 	h := newHarnessWithRepo(t, unsyncedRepo{})
 
 	for _, path := range []string{"/api/v1/services", "/api/v1/services/web/history"} {
-		resp := h.do(t, http.MethodGet, path, "", remoteUser("admin"))
+		resp := h.do(t, http.MethodGet, path, "", proxied("admin"))
 		if detail := errorField(t, resp); strings.Contains(detail, syntheticToken) {
 			t.Errorf("GET %s echoed the raw sync error to the client: %q", path, detail)
 		}
@@ -1023,7 +1015,7 @@ func TestTheSyncErrorTextNeverReachesTheDeployClient(t *testing.T) {
 	h.engine.mu.Unlock()
 
 	resp := h.do(t, http.MethodPost, "/api/v1/services/web/deploy",
-		`{"digest":"`+digestLatest+`"}`, remoteUser("admin"))
+		`{"digest":"`+digestLatest+`"}`, proxied("admin"))
 	if resp.StatusCode != http.StatusBadGateway {
 		t.Fatalf("deploy over a failing sync = %d, want 502", resp.StatusCode)
 	}
@@ -1045,7 +1037,7 @@ func TestValidationErrorsStillReachTheDeployClient(t *testing.T) {
 	h.engine.mu.Unlock()
 
 	resp := h.do(t, http.MethodPost, "/api/v1/services/web/deploy",
-		`{"digest":"`+digestLatest+`"}`, remoteUser("admin"))
+		`{"digest":"`+digestLatest+`"}`, proxied("admin"))
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("validation error = %d, want 400", resp.StatusCode)
 	}
@@ -1072,7 +1064,7 @@ var errRemoteUnreachable = errors.New("the configuration repository could not be
 func TestAStaleMirrorReportsTheRemoteAndKeepsItsServices(t *testing.T) {
 	h := newHarnessWithRepo(t, staleRepo{})
 
-	resp := h.do(t, http.MethodGet, "/api/v1/services", "", remoteUser("admin"))
+	resp := h.do(t, http.MethodGet, "/api/v1/services", "", proxied("admin"))
 	if resp.StatusCode != http.StatusBadGateway {
 		t.Fatalf("GET /services with a stale mirror = %d, want 502", resp.StatusCode)
 	}
@@ -1085,7 +1077,7 @@ func TestAStaleMirrorReportsTheRemoteAndKeepsItsServices(t *testing.T) {
 	}
 
 	resp = h.do(t, http.MethodPost, "/api/v1/services/web/deploy",
-		`{"digest":"`+digestLatest+`"}`, remoteUser("admin"))
+		`{"digest":"`+digestLatest+`"}`, proxied("admin"))
 	if resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("deploy of a known service during a refresh failure = %d, want 202",
 			resp.StatusCode)
@@ -1104,6 +1096,7 @@ func TestEventsStreamDeliversEngineEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 	req.Header.Set("Remote-User", "admin")
+	req.Header.Set(ProxySecretHeader, testProxySecret)
 
 	resp, err := h.srv.Client().Do(req)
 	if err != nil {
@@ -1163,6 +1156,7 @@ func openEventStream(t *testing.T, h *harness) *bufio.Scanner {
 		t.Fatal(err)
 	}
 	req.Header.Set("Remote-User", "admin")
+	req.Header.Set(ProxySecretHeader, testProxySecret)
 	resp, err := h.srv.Client().Do(req)
 	if err != nil {
 		t.Fatalf("connect to events: %v", err)
