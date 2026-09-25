@@ -126,7 +126,7 @@ reads it once at start-up. With Caddy in front:
 
 ```
 reverse_proxy 127.0.0.1:8092 {
-	header_up X-Snowdeploy-Proxy-Secret {file./etc/caddy/secrets/snowdeploy-proxy-secret}
+	header_up X-Snowdeploy-Proxy-Secret {file./etc/caddy/secrets/deploy-proxy-secret}
 }
 ```
 

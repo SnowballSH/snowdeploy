@@ -47,6 +47,9 @@ func TestForgedRemoteUserWithoutTheProxySecretIsRejected(t *testing.T) {
 		{http.MethodPost, "/api/v1/services/web/rollback", ""},
 		{http.MethodPost, "/api/v1/services/web/converge", ""},
 		{http.MethodGet, "/api/v1/services/web/history", ""},
+		{http.MethodGet, "/api/v1/services", ""},
+		{http.MethodGet, "/api/v1/services/web/revisions?digests=" + digestLatest, ""},
+		{http.MethodGet, "/api/v1/events", ""},
 	} {
 		resp := h.do(t, route.method, route.path, route.body, map[string]string{"Remote-User": "admin"})
 		if resp.StatusCode != http.StatusUnauthorized {
@@ -103,7 +106,7 @@ func TestRepeatedProxyHeadersAreRejected(t *testing.T) {
 
 func TestIdentityOutsideTheAllowlistIsRejected(t *testing.T) {
 	h := newHarness(t)
-	for _, name := range []string{"family", "Admin", "admin, family"} {
+	for _, name := range []string{"", "family", "Admin", "admin, family"} {
 		resp := h.do(t, http.MethodPost, "/api/v1/services/web/deploy", deployBody, proxied(name))
 		if resp.StatusCode != http.StatusUnauthorized {
 			t.Errorf("Remote-User %q = %d, want 401", name, resp.StatusCode)
