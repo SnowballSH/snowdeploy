@@ -4,6 +4,7 @@
  * a same-origin fetch with no Authorization header of its own.
  */
 import type {
+  Accepted,
   DeployEvent,
   HistoryEntry,
   Revision,
@@ -49,27 +50,39 @@ export async function fetchRevisions(
 
 async function post(
   service: string,
-  action: "deploy" | "rollback",
-  digest: string,
-): Promise<number> {
+  action: "deploy" | "rollback" | "converge",
+  body?: unknown,
+): Promise<Accepted> {
+  const init: RequestInit =
+    body === undefined
+      ? { method: "POST" }
+      : {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        };
   const response = await fetch(
     `/api/v1/services/${encodeURIComponent(service)}/${action}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ digest }),
-    },
+    init,
   );
-  const body = await json<{ journalId: number }>(response);
-  return body.journalId;
+  const accepted = await json<Partial<Accepted>>(response);
+  return { journalId: accepted.journalId ?? 0, joined: accepted.joined === true };
 }
 
-export function deploy(service: string, digest: string): Promise<number> {
-  return post(service, "deploy", digest);
+export function deploy(service: string, digest: string): Promise<Accepted> {
+  return post(service, "deploy", { digest });
 }
 
-export function rollback(service: string, digest: string): Promise<number> {
-  return post(service, "rollback", digest);
+export function rollback(service: string, digest: string): Promise<Accepted> {
+  return post(service, "rollback", { digest });
+}
+
+/**
+ * converge sends no body: the daemon applies the manifest main holds at the
+ * front of the queue, so there is no digest for the page to choose.
+ */
+export function converge(service: string): Promise<Accepted> {
+  return post(service, "converge");
 }
 
 /**

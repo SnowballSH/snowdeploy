@@ -1,6 +1,7 @@
 <script lang="ts">
   import { Button, Panel, Skeleton } from "foundationui/svelte";
   import CommitLine from "../lib/CommitLine.svelte";
+  import ConvergeConfirm from "../lib/ConvergeConfirm.svelte";
   import DeployConfirm from "../lib/DeployConfirm.svelte";
   import OutcomeBadge from "../lib/OutcomeBadge.svelte";
   import ProgressRail from "../lib/ProgressRail.svelte";
@@ -10,6 +11,7 @@
     shortDigest,
     updateAvailable,
     prLink,
+    type Accepted,
     type HistoryEntry,
     type Progress,
     type Revision,
@@ -26,6 +28,7 @@
     loaded,
     onDeploy,
     onRollback,
+    onConverge,
   }: {
     name: string;
     service: ServiceStatus | undefined;
@@ -37,9 +40,11 @@
     loaded: boolean;
     onDeploy: (service: string, digest: string) => Promise<void>;
     onRollback: (service: string, digest: string) => Promise<void>;
+    onConverge: (service: string) => Promise<Accepted>;
   } = $props();
 
   let confirmOpen = $state(false);
+  let convergeOpen = $state(false);
 
   function when(value: string): string {
     if (!value) return "—";
@@ -76,6 +81,14 @@
         {#if service}
           <div class="flex items-center gap-2">
             <StatusBadge {service} {progress} />
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={!!progress}
+              onclick={() => (convergeOpen = true)}
+            >
+              Converge
+            </Button>
             <Button
               variant="primary"
               size="sm"
@@ -194,5 +207,12 @@
     digest={service.latestAvailable}
     revision={revisions[service.latestAvailable]}
     onConfirm={onDeploy}
+  />
+  <ConvergeConfirm
+    bind:open={convergeOpen}
+    service={name}
+    digest={service.manifestDigest}
+    revision={revisions[service.manifestDigest]}
+    onConfirm={onConverge}
   />
 {/if}

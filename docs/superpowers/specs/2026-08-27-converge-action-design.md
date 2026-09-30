@@ -98,7 +98,9 @@ sends no body for converge.
 
 - A converge button in the web UI. The UI renders converge runs arriving on
   the event stream (action rides on every event and history row); adding a
-  button is a separate, purely frontend change.
+  button is a separate, purely frontend change. (Since added: the service
+  page's **Converge** button, which reports a joined pending run in its
+  dialog.)
 - Skipping the restart when the rendered unit is byte-identical to what is on
   the host. Converge is a deliberate operator action; an occasional no-op
   restart, gated by the probe, is acceptable. Revisit only if converge grows

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { Callout, PageShell, ThemeToggle } from "foundationui/svelte";
   import {
+    converge,
     deploy,
     fetchHistory,
     fetchRevisions,
@@ -13,6 +14,7 @@
   import Services from "./routes/Services.svelte";
   import {
     applyEvent,
+    type Accepted,
     initialState,
     isTerminal,
     setError,
@@ -70,11 +72,12 @@
   // rethrown so the surface the user is actually looking at (the confirm
   // dialog) can hold it in place.
   async function act(
-    run: () => Promise<number>,
+    run: () => Promise<Accepted>,
     service: string,
-  ): Promise<void> {
+  ): Promise<Accepted> {
+    let accepted: Accepted;
     try {
-      await run();
+      accepted = await run();
       store = setError(store, null);
     } catch (err) {
       store = setError(store, err instanceof Error ? err.message : String(err));
@@ -82,13 +85,19 @@
     }
     await refresh();
     if (route.name === "service") await loadHistory(service);
+    return accepted;
   }
 
-  const onDeploy = (service: string, digest: string) =>
-    act(() => deploy(service, digest), service);
+  const onDeploy = async (service: string, digest: string) => {
+    await act(() => deploy(service, digest), service);
+  };
 
-  const onRollback = (service: string, digest: string) =>
-    act(() => rollback(service, digest), service);
+  const onRollback = async (service: string, digest: string) => {
+    await act(() => rollback(service, digest), service);
+  };
+
+  const onConverge = (service: string) =>
+    act(() => converge(service), service);
 
   $effect(() => {
     const onPop = () => {
@@ -179,6 +188,7 @@
       loaded={store.loaded}
       {onDeploy}
       {onRollback}
+      {onConverge}
     />
   {:else}
     <Services

@@ -32,6 +32,13 @@ export interface DeployEvent {
   mergeUrl?: string;
 }
 
+/** The daemon's 202: the run to follow, and whether the request joined a
+ * run already pending instead of starting another. */
+export interface Accepted {
+  journalId: number;
+  joined: boolean;
+}
+
 /** The commit an image digest was built from, when the registry knows it. */
 export interface Revision {
   sha: string;
@@ -271,4 +278,17 @@ export function updateAvailable(service: ServiceStatus): boolean {
     service.latestAvailable !== "" &&
     service.latestAvailable !== service.manifestDigest
   );
+}
+
+/**
+ * joinedNotice explains a click that started nothing: the daemon answered
+ * with a run already pending, so the page is following that run instead.
+ */
+export function joinedNotice(
+  service: string,
+  action: string,
+  accepted: Accepted,
+): string | null {
+  if (!accepted.joined) return null;
+  return `A ${action} of ${service} was already pending as run #${accepted.journalId}; this request joined it rather than starting another.`;
 }
