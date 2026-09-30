@@ -3,6 +3,7 @@ import {
   applyEvent,
   initialState,
   isTerminal,
+  joinedNotice,
   lifecycleIndex,
   setError,
   setHistory,
@@ -278,5 +279,38 @@ describe("history receipt updates", () => {
       event({ state: "rolled-back", journalId: 8, action: "rollback" }),
     );
     expect(s.history.web?.[0]?.Action).toBe("rollback");
+  });
+});
+
+describe("joinedNotice", () => {
+  it("is silent when the request started its own run", () => {
+    expect(
+      joinedNotice("kami", "converge", { journalId: 41, joined: false }),
+    ).toBeNull();
+  });
+
+  it("names the pending run a joined request is following", () => {
+    const notice = joinedNotice("kami", "converge", {
+      journalId: 40,
+      joined: true,
+    });
+    expect(notice).toContain("converge of kami");
+    expect(notice).toContain("run #40");
+  });
+});
+
+describe("a converge run", () => {
+  it("lands in history as a converge, not a deploy", () => {
+    let s = initialState();
+    s = applyEvent(s, event({ action: "converge", state: "detected" }));
+    expect(s.active["web"]?.state).toBe("detected");
+
+    s = applyEvent(
+      s,
+      event({ action: "converge", state: "failed", detail: "probe failed" }),
+    );
+    expect(s.active["web"]).toBeUndefined();
+    expect(s.history["web"]?.[0]?.Action).toBe("converge");
+    expect(s.history["web"]?.[0]?.State).toBe("failed");
   });
 });

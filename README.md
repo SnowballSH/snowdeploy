@@ -174,7 +174,8 @@ re-renders and re-applies the manifest as main has it — no pull request, since
 the change already went through review — and, unlike a deploy, it has no
 automatic rollback: the previously rendered unit is recorded nowhere, so a
 failed probe leaves the run `failed` with instructions rather than silently
-restoring anything.
+restoring anything. The web UI offers the same action as **Converge** on each
+service's page, behind a confirmation that says so.
 
 ## Security model
 
