@@ -132,17 +132,19 @@ type Options struct {
 
 // Server is the API. Publish feeds it the engine's events.
 type Server struct {
-	opts    Options
-	auth    *authenticator
-	broker  *broker
-	metrics *metrics
+	opts        Options
+	auth        *authenticator
+	crossOrigin *http.CrossOriginProtection
+	broker      *broker
+	metrics     *metrics
 }
 
 // New builds the server.
 func New(opts Options) *Server {
 	s := &Server{
-		opts: opts,
-		auth: &authenticator{tokenHashFile: opts.CLITokenHashFile, proxy: opts.Proxy},
+		opts:        opts,
+		auth:        &authenticator{tokenHashFile: opts.CLITokenHashFile, proxy: opts.Proxy},
+		crossOrigin: http.NewCrossOriginProtection(),
 	}
 	s.metrics = newMetrics(func() float64 {
 		if opts.Engine == nil {
@@ -227,8 +229,17 @@ func (s *Server) authed(h actorHandler) http.Handler {
 
 // authedFor guards a mutating route: the identity must also be allowed to take
 // that action, so a token issued for converge alone cannot move a pin.
+//
+// A browser request from any other origin is refused before identity is
+// considered. The proxy authenticates the browser by a session cookie that is
+// sent on same-site requests too, so without this a page on a sibling
+// subdomain could ride the operator's session into a converge or rollback.
 func (s *Server) authedFor(act action, h actorHandler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := s.crossOrigin.Check(r); err != nil {
+			writeError(w, http.StatusForbidden, errors.New("cross-origin request refused"))
+			return
+		}
 		actor, allowed, ok := s.identify(w, r)
 		if !ok {
 			return
