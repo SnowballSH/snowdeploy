@@ -156,6 +156,10 @@ refused. `same-site` is refused too, because the proxy's session cookie
 travels with requests from sibling subdomains. The CLI and other tooling send
 neither header and are unaffected. The proxy must therefore pass the original
 `Host` through, which Caddy's `reverse_proxy` does by default.
+A browser that sends no `Sec-Fetch-Site` (Safari before 16.4, for one) is
+judged by `Origin` alone, and behind `Referrer-Policy: no-referrer` it sends
+`Origin: null` even on the UI's own POSTs, so its Deploy, Rollback and
+Converge buttons answer `403`; use a current browser or the CLI.
 
 The listener must stay on loopback, and the daemon refuses to start on any
 other address. Loopback narrows who can connect; the shared secret, not the
